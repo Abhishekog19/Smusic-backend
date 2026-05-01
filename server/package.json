@@ -1,0 +1,22 @@
+{
+  "name": "smusic-backend",
+  "version": "1.0.0",
+  "description": "Smusic backend API server — TIDAL proxy, Spotify import, audio stream proxy",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "axios": "^1.9.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^5.2.1",
+    "ioredis": "^5.3.2"
+  }
+}
