@@ -102,6 +102,67 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
   return { streamUrl, format, quality: tidalQuality };
 }
 
+// ─── GET /api/tidal-download/search ──────────────────────────────────────────
+// Free-text search across TIDAL. Used by Groove Android app's search screen.
+// Returns results matching the TidalSearchTrack DTO shape the app expects.
+router.get('/search', async (req, res) => {
+  const origin = req.headers.origin || null;
+  res.setHeader('Access-Control-Allow-Origin', isOriginAllowed(origin) ? (origin || '*') : '*');
+
+  const { q, limit = 20 } = req.query;
+  if (!q || !q.trim()) {
+    return res.status(400).json({ error: 'Missing required query param: q' });
+  }
+
+  try {
+    const searchLimit = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
+    const url = `${TIDAL_SEARCH_API}/search/tracks?query=${encodeURIComponent(q.trim())}&countryCode=${TIDAL_COUNTRY}&limit=${searchLimit}`;
+    const r = await fetch(url, {
+      headers: {
+        'X-Tidal-Token': TIDAL_TOKEN,
+        'Accept': 'application/json',
+        'User-Agent': BROWSER_UA,
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!r.ok) {
+      const text = await r.text().catch(() => r.statusText);
+      throw new Error(`TIDAL search returned ${r.status}: ${text.slice(0, 200)}`);
+    }
+
+    const data = await r.json();
+    const items = data?.items || [];
+
+    // Map to the shape the Groove Android app's TidalSearchTrack DTO expects
+    const results = items.map(track => {
+      const artistName = track.artists?.map(a => a.name).filter(Boolean).join(', ') || '';
+      const albumTitle = track.album?.title || '';
+      const albumCover = track.album?.cover
+        ? `https://resources.tidal.com/images/${track.album.cover.replace(/-/g, '/')}/640x640.jpg`
+        : null;
+      const durationMs = (track.duration || 0) * 1000;
+      const isrc = track.isrc || null;
+
+      return {
+        id: track.id,
+        title: track.title || '',
+        artist: artistName,
+        album: albumTitle,
+        albumArt: albumCover,
+        durationMs,
+        isrc,
+      };
+    });
+
+    console.log(`[tidal-download/search] "${q}" → ${results.length} results`);
+    return res.json({ results });
+  } catch (err) {
+    console.error('[tidal-download/search] Failed:', err.message);
+    return res.status(502).json({ error: 'TIDAL search failed', details: err.message });
+  }
+});
+
 // ─── GET /api/tidal-download/resolve ─────────────────────────────────────────
 // Resolves a Spotify track (by title/artist/ISRC) to a TIDAL direct stream URL.
 // Android DownloadWorker polls this before downloading.
