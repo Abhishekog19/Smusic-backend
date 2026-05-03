@@ -329,8 +329,7 @@ async function getTidalStreamUrl(trackId, preferredQuality = 'LOSSLESS') {
 
 // ─── GET /api/tidal-download/search ──────────────────────────────────────────
 // Free-text search across TIDAL via V2 proxy mirrors.
-// Used by Groove Android app's search screen.
-// Returns results matching the TidalSearchTrack DTO shape the app expects.
+// Retries aggressively across all mirrors before returning 502.
 router.get('/search', async (req, res) => {
   const origin = req.headers.origin || null;
   res.setHeader('Access-Control-Allow-Origin', isOriginAllowed(origin) ? (origin || '*') : '*');
@@ -340,47 +339,54 @@ router.get('/search', async (req, res) => {
     return res.status(400).json({ error: 'Missing required query param: q' });
   }
 
-  try {
-    // Use V2 proxy search endpoint: /search/?s=...
-    const path = `/search/?s=${encodeURIComponent(q.trim())}`;
-    const { response, target } = await fetchV2(path);
-    const data = await response.json();
+  const searchLimit = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
+  const path = `/search/?s=${encodeURIComponent(q.trim())}`;
 
-    // V2 proxies return data in various nested shapes — find the items array
-    const items = findItems(data) || [];
+  // Try up to 3 independent fetchV2 calls (each tries up to 8 mirrors internally)
+  // before admitting defeat — this handles the case where most mirrors are down.
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const { response, target } = await fetchV2(path, 8);
+      const data = await response.json();
+      const items = findItems(data) || [];
 
-    // Map to the shape the Groove Android app's TidalSearchTrack DTO expects
-    const searchLimit = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
-    const results = items.slice(0, searchLimit).map(track => {
-      // Normalize artists — V2 proxies use `artists` array, may or may not have `artist`
-      const artistName = track.artists?.map(a => a.name).filter(Boolean).join(', ')
-                      || track.artist?.name
-                      || '';
-      const albumTitle = track.album?.title || '';
-      const albumCover = track.album?.cover
-        ? `https://resources.tidal.com/images/${track.album.cover.replace(/-/g, '/')}/640x640.jpg`
-        : null;
-      const durationMs = (track.duration || 0) * 1000;
-      const isrc = track.isrc || null;
+      const results = items.slice(0, searchLimit).map(track => {
+        const artistName = track.artists?.map(a => a.name).filter(Boolean).join(', ')
+                        || track.artist?.name
+                        || track.artist
+                        || '';
+        const albumTitle = track.album?.title || '';
+        const albumCover = track.album?.cover
+          ? `https://resources.tidal.com/images/${track.album.cover.replace(/-/g, '/')}/640x640.jpg`
+          : null;
+        const durationMs = (track.duration || 0) * 1000;
 
-      return {
-        id: track.id,
-        title: track.title || '',
-        artist: artistName,
-        album: albumTitle,
-        albumArt: albumCover,
-        durationMs,
-        isrc,
-      };
-    });
+        return {
+          id:        track.id,
+          title:     track.title || '',
+          artist:    artistName,
+          album:     albumTitle,
+          albumArt:  albumCover,
+          durationMs,
+          isrc:      track.isrc || null,
+        };
+      });
 
-    console.log(`[tidal-v2/search] "${q}" via ${target.name} → ${results.length} results`);
-    return res.json({ results });
-  } catch (err) {
-    console.error('[tidal-v2/search] Failed:', err.message);
-    return res.status(502).json({ error: 'TIDAL search failed', details: err.message });
+      console.log(`[tidal-v2/search] "${q}" via ${target.name} (attempt ${attempt + 1}) → ${results.length} results`);
+      return res.json({ results });
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[tidal-v2/search] Attempt ${attempt + 1} failed: ${err.message}`);
+      // Short pause before next attempt so we hit different mirrors
+      if (attempt < 2) await new Promise(r => setTimeout(r, 800));
+    }
   }
+
+  console.error('[tidal-v2/search] All attempts failed:', lastErr?.message);
+  return res.status(502).json({ error: 'TIDAL search failed after retries', details: lastErr?.message });
 });
+
 
 // ─── GET /api/tidal-download/resolve ─────────────────────────────────────────
 // Resolves a Spotify track (by title/artist/ISRC) to a TIDAL direct stream URL.
