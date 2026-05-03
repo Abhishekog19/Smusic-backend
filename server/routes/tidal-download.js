@@ -8,22 +8,25 @@ import { getSpotifyTrack } from '../lib/spotifySession.js';
 const router = express.Router();
 
 // ─── V2 TIDAL Proxy Mirrors ──────────────────────────────────────────────────
-// These are the same proxy mirrors used by the web app (config.ts).
-// They handle TIDAL auth internally — no token needed from our side.
+// These mirrors handle TIDAL auth internally — no token needed from our side.
 const APP_VERSION = '1.0.0';
 
 const V2_TARGETS = [
-  { name: 'squid-api',    baseUrl: 'https://triton.squid.wtf',         weight: 15 },
-  { name: 'spotisaver-1', baseUrl: 'https://hifi-one.spotisaver.net',  weight: 15 },
-  { name: 'spotisaver-2', baseUrl: 'https://hifi-two.spotisaver.net',  weight: 15 },
+  { name: 'squid-api',    baseUrl: 'https://triton.squid.wtf',         weight: 20 },
+  { name: 'spotisaver-1', baseUrl: 'https://hifi-one.spotisaver.net',  weight: 20 },
+  { name: 'spotisaver-2', baseUrl: 'https://hifi-two.spotisaver.net',  weight: 20 },
   { name: 'kinoplus',     baseUrl: 'https://tidal.kinoplus.online',    weight: 15 },
   { name: 'hund',         baseUrl: 'https://hund.qqdl.site',           weight: 15 },
   { name: 'katze',        baseUrl: 'https://katze.qqdl.site',          weight: 15 },
   { name: 'maus',         baseUrl: 'https://maus.qqdl.site',           weight: 15 },
   { name: 'vogel',        baseUrl: 'https://vogel.qqdl.site',          weight: 15 },
   { name: 'wolf',         baseUrl: 'https://wolf.qqdl.site',           weight: 15 },
-  { name: 'monochrome',   baseUrl: 'https://arran.monochrome.tf',      weight: 15 },
+  { name: 'monochrome',   baseUrl: 'https://arran.monochrome.tf',      weight: 10 },
 ];
+
+// Quality levels to try in order — most mirrors don't support LOSSLESS without auth
+// so we fall back through progressively lower qualities until one works.
+const QUALITY_FALLBACK_CHAIN = ['LOSSLESS', 'HI_RES_LOSSLESS', 'HIGH', 'LOW', 'AAC_320'];
 
 const FALLBACK_BASE = 'https://tidal.401658.xyz';
 
@@ -62,40 +65,23 @@ function buildHeaders(target) {
 /**
  * Fetch from V2 proxy with automatic retry across multiple mirrors.
  * Tries up to `maxAttempts` different targets before giving up.
+ * Uses a longer timeout (20s) since some mirrors are slow.
  */
-async function fetchV2(path, maxAttempts = 4) {
+async function fetchV2(path, maxAttempts = 5) {
   const tried = new Set();
   let lastError = null;
 
-  for (let i = 0; i < maxAttempts; i++) {
-    const target = selectTarget();
-    // Avoid hitting the same target twice in a row
-    if (tried.has(target.name) && i < V2_TARGETS.length) {
-      const fallback = V2_TARGETS.find(t => !tried.has(t.name));
-      if (fallback) {
-        tried.add(fallback.name);
-        const url = `${fallback.baseUrl.replace(/\/+$/, '')}${path}`;
-        try {
-          const r = await fetch(url, {
-            headers: buildHeaders(fallback),
-            signal: AbortSignal.timeout(12000),
-          });
-          if (r.ok) return { response: r, target: fallback };
-          console.warn(`[tidal-v2] ${fallback.name} returned ${r.status} for ${path}`);
-        } catch (err) {
-          console.warn(`[tidal-v2] ${fallback.name} failed: ${err.message}`);
-          lastError = err;
-        }
-        continue;
-      }
-    }
+  // Shuffle a fresh copy of targets so each request gets a different order
+  const shuffled = [...V2_TARGETS].sort(() => Math.random() - 0.5);
 
+  for (let i = 0; i < Math.min(maxAttempts, shuffled.length); i++) {
+    const target = shuffled[i];
     tried.add(target.name);
     const url = `${target.baseUrl.replace(/\/+$/, '')}${path}`;
     try {
       const r = await fetch(url, {
         headers: buildHeaders(target),
-        signal: AbortSignal.timeout(12000),
+        signal: AbortSignal.timeout(20000),  // 20s — some mirrors are slow
       });
       if (r.ok) return { response: r, target };
       console.warn(`[tidal-v2] ${target.name} returned ${r.status} for ${path}`);
@@ -111,9 +97,10 @@ async function fetchV2(path, maxAttempts = 4) {
     const url = `${FALLBACK_BASE}${path}`;
     const r = await fetch(url, {
       headers: { 'Accept': 'application/json', 'User-Agent': BROWSER_UA },
-      signal: AbortSignal.timeout(12000),
+      signal: AbortSignal.timeout(20000),
     });
     if (r.ok) return { response: r, target: { name: 'fallback', baseUrl: FALLBACK_BASE } };
+    console.warn(`[tidal-v2] Fallback returned ${r.status} for ${path}`);
   } catch (err) {
     console.warn(`[tidal-v2] Fallback also failed: ${err.message}`);
   }
@@ -195,32 +182,44 @@ function decodeManifest(manifest) {
 
 /**
  * Extract a stream URL from a V2 track response.
- * V2 proxies return the track + stream info in one response.
- * The manifest may contain direct URLs or a DASH MPD.
+ * V2 proxies return the track + stream info in various formats.
+ * Handles: direct URL, urls array, manifest (JSON or MPD/XML), nested data.
  */
 function extractStreamUrl(data) {
-  // V2 container format: { version: "2.x", data: { ... } }
+  // V2 container format: { version: "2.x", data: { ... } } or just { ... }
   const container = data?.data ?? data;
 
-  // If it's an array (older format), find the info entry with a manifest
+  // If it's an array (older format or multi-entry), find any entry with a URL/manifest
   if (Array.isArray(container)) {
     for (const entry of container) {
       if (entry?.manifest) {
-        return extractFromManifest(entry.manifest);
+        const u = extractFromManifest(entry.manifest);
+        if (u) return u;
       }
-      if (entry?.url) return entry.url;
-      if (entry?.urls?.[0]) return entry.urls[0];
+      if (entry?.url && entry.url.startsWith('http')) return entry.url;
+      if (Array.isArray(entry?.urls) && entry.urls[0]?.startsWith('http')) return entry.urls[0];
     }
     return null;
   }
 
-  // Direct URL fields
-  if (container?.url) return container.url;
-  if (container?.urls?.[0]) return container.urls[0];
+  // Direct URL fields (flat response)
+  if (container?.url && typeof container.url === 'string' && container.url.startsWith('http'))
+    return container.url;
+  if (Array.isArray(container?.urls) && container.urls[0]?.startsWith('http'))
+    return container.urls[0];
 
-  // Manifest-based
+  // Manifest-based (base64-encoded JSON or MPD XML)
   if (container?.manifest) {
-    return extractFromManifest(container.manifest);
+    const u = extractFromManifest(container.manifest);
+    if (u) return u;
+  }
+
+  // Some mirrors nest under trackPlaybackInfo / streamInfo / track
+  for (const key of ['trackPlaybackInfo', 'streamInfo', 'track', 'playbackInfo']) {
+    if (container?.[key]) {
+      const nested = extractStreamUrl(container[key]);
+      if (nested) return nested;
+    }
   }
 
   return null;
@@ -228,14 +227,19 @@ function extractStreamUrl(data) {
 
 function extractFromManifest(manifest) {
   const decoded = decodeManifest(manifest);
+  if (!decoded) return null;
 
-  // Try JSON format first: { urls: ["https://..."] }
+  // Try JSON format: { urls: ["https://..."] } or { url: "https://..." }
   try {
     const parsed = JSON.parse(decoded);
-    if (Array.isArray(parsed.urls) && parsed.urls.length > 0) {
+    if (Array.isArray(parsed.urls) && parsed.urls.length > 0 && parsed.urls[0]?.startsWith('http'))
       return parsed.urls[0];
-    }
-  } catch { /* not JSON */ }
+    if (typeof parsed.url === 'string' && parsed.url.startsWith('http'))
+      return parsed.url;
+    // Some mirrors: { mimeType, codecs, urls: [...] }
+    if (parsed.mimeType && Array.isArray(parsed.urls) && parsed.urls[0])
+      return parsed.urls[0];
+  } catch { /* not JSON — try XML */ }
 
   // Try MPD/XML: extract <BaseURL>
   const baseUrlMatch = decoded.match(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/i);
@@ -244,15 +248,22 @@ function extractFromManifest(manifest) {
     if (url.startsWith('http')) return url;
   }
 
-  // Regex fallback: find any URL that looks like audio
+  // MPD initialization segment URL
+  const initMatch = decoded.match(/initialization="([^"]+)"/i);
+  if (initMatch?.[1] && initMatch[1].startsWith('http')) {
+    return initMatch[1].split('$')[0]; // strip template suffix
+  }
+
+  // Regex fallback: find any URL that looks like a full audio file
   const urlRegex = /https?:\/\/[\w\-.~:?#[\]@!$&'()*+,;=%/]+/g;
   let match;
   while ((match = urlRegex.exec(decoded)) !== null) {
-    const url = match[0];
-    if (url.includes('$Number$')) continue;     // template, not a direct URL
-    if (/\/\d+\.mp4/.test(url)) continue;       // segment, not full file
+    const url = match[0].replace(/[)"']+$/, ''); // strip trailing punctuation
+    if (url.includes('$Number$')) continue;  // template, not direct
+    if (/\/\d+\.mp4$/.test(url)) continue;  // segment chunk, not full file
     if (url.includes('.flac') || url.includes('.mp4') || url.includes('.m4a') ||
-        url.includes('token=') || url.includes('/audio/')) {
+        url.includes('.aac') || url.includes('token=') || url.includes('/audio/') ||
+        url.includes('tidal.com/')) {
       return url;
     }
   }
@@ -262,29 +273,58 @@ function extractFromManifest(manifest) {
 
 /**
  * Get a TIDAL stream URL for a track ID via V2 proxies.
- * Uses /track/?id=...&quality=... endpoint (same as web app's LosslessAPI.getTrack).
+ * Tries multiple quality levels in sequence — most mirrors don't support LOSSLESS
+ * without auth, so we fall back to HIGH/LOW until we get a working stream URL.
+ *
+ * @param {number|string} trackId - TIDAL track ID
+ * @param {string} preferredQuality - Preferred quality ('LOSSLESS', 'HIGH', 'LOW')
+ * @returns {{ streamUrl: string, format: string, quality: string }}
  */
-async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
-  const qualityMap = {
-    LOSSLESS: 'LOSSLESS',
-    HI_RES: 'HI_RES_LOSSLESS',
-    HIGH: 'HIGH',
-    LOW: 'LOW',
-  };
-  const tidalQuality = qualityMap[quality] || 'LOSSLESS';
-  const path = `/track/?id=${trackId}&quality=${tidalQuality}`;
+async function getTidalStreamUrl(trackId, preferredQuality = 'LOSSLESS') {
+  // Build quality fallback chain starting from preferred quality
+  const startIdx = QUALITY_FALLBACK_CHAIN.indexOf(preferredQuality);
+  const qualitiesToTry = startIdx >= 0
+    ? QUALITY_FALLBACK_CHAIN.slice(startIdx)
+    : QUALITY_FALLBACK_CHAIN;
 
-  const { response, target } = await fetchV2(path);
-  const data = await response.json();
+  let lastError = null;
 
-  const streamUrl = extractStreamUrl(data);
-  if (!streamUrl) {
-    throw new Error(`No stream URL found in ${target.name} response for track ${trackId}`);
+  for (const tidalQuality of qualitiesToTry) {
+    // Try two URL formats that different mirrors accept:
+    // Format A: /track/?id=<id>&quality=<quality>  (most mirrors)
+    // Format B: /track/<id>?quality=<quality>       (some mirrors use path segment)
+    const pathsToTry = [
+      `/track/?id=${trackId}&quality=${tidalQuality}`,
+      `/track/${trackId}?quality=${tidalQuality}`,
+    ];
+
+    for (const path of pathsToTry) {
+      try {
+        const { response, target } = await fetchV2(path, 3);
+        const data = await response.json();
+
+        // Log response shape to help debug future issues
+        const topKeys = Object.keys(data || {}).join(', ');
+        console.log(`[tidal-v2] ${target.name} (${tidalQuality}) response keys: [${topKeys}]`);
+
+        const streamUrl = extractStreamUrl(data);
+        if (streamUrl) {
+          const isLossless = tidalQuality === 'LOSSLESS' || tidalQuality === 'HI_RES_LOSSLESS';
+          const format = isLossless ? 'flac' : 'm4a';
+          console.log(`[tidal-v2] ✓ Stream URL via ${target.name} @ ${tidalQuality}: ${streamUrl.substring(0, 80)}...`);
+          return { streamUrl, format, quality: tidalQuality };
+        }
+
+        console.warn(`[tidal-v2] ${target.name} returned no extractable URL for track ${trackId} @ ${tidalQuality}`);
+        console.warn(`[tidal-v2] Raw data sample: ${JSON.stringify(data).substring(0, 300)}`);
+      } catch (err) {
+        console.warn(`[tidal-v2] ${tidalQuality}/${path} failed: ${err.message}`);
+        lastError = err;
+      }
+    }
   }
 
-  const format = tidalQuality.includes('LOSSLESS') ? 'flac' : 'm4a';
-  console.log(`[tidal-v2] Stream URL via ${target.name}: ${streamUrl.substring(0, 80)}...`);
-  return { streamUrl, format, quality: tidalQuality };
+  throw lastError || new Error(`No working stream URL found for track ${trackId} after trying all qualities`);
 }
 
 // ─── GET /api/tidal-download/search ──────────────────────────────────────────
