@@ -431,6 +431,10 @@ router.get('/resolve', async (req, res) => {
 
 // ─── GET /api/tidal-download/stream ──────────────────────────────────────────
 // Proxies TIDAL CDN audio to the Android device via native Node.js https pipe.
+//
+// CRITICAL: ExoPlayer sends "Range: bytes=X-Y" for seeking/buffering.
+// We MUST forward this to the TIDAL CDN and relay "Content-Range" + "Accept-Ranges"
+// back, otherwise ExoPlayer gets a 200 response when it expects 206 and fails.
 router.get('/stream', (req, res) => {
   const { url: streamUrl } = req.query;
   if (!streamUrl) return res.status(400).json({ error: 'Missing url param' });
@@ -442,45 +446,73 @@ router.get('/stream', (req, res) => {
     return res.status(400).json({ error: 'Invalid stream URL' });
   }
 
+  // Forward Range header from ExoPlayer — required for seek + progressive download
+  const upstreamHeaders = {
+    'User-Agent': BROWSER_UA,
+    'Accept': 'audio/flac, audio/mp4, audio/*, */*',
+    'Accept-Encoding': 'identity',
+  };
+  if (req.headers['range']) {
+    upstreamHeaders['Range'] = req.headers['range'];
+    console.log(`[tidal/stream] Forwarding Range: ${req.headers['range']}`);
+  }
+
   const proto = parsedUrl.protocol === 'https:' ? https : http;
   const proxyReq = proto.request(
     {
       hostname: parsedUrl.hostname,
-      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
-      path: parsedUrl.pathname + parsedUrl.search,
-      method: 'GET',
-      headers: {
-        'User-Agent': BROWSER_UA,
-        Accept: 'audio/flac, audio/mp4, audio/*, */*',
-        'Accept-Encoding': 'identity',
-      },
+      port:     parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path:     parsedUrl.pathname + parsedUrl.search,
+      method:   'GET',
+      headers:  upstreamHeaders,
     },
     (upstream) => {
       const status = upstream.statusCode || 502;
+
       if (status >= 400) {
         let body = '';
         upstream.on('data', c => (body += c.toString()));
         upstream.on('end', () => {
           if (!res.headersSent) {
-            res.status(status).json({ error: `TIDAL CDN returned ${status}`, hint: status === 401 ? 'Token expired' : undefined });
+            res.status(status).json({
+              error: `TIDAL CDN returned ${status}`,
+              hint: status === 401 ? 'Stream URL expired — resolve again' : undefined,
+            });
           }
         });
         return;
       }
+
+      // Relay status (200 or 206 Partial Content)
       res.status(status);
+
+      // ── Relay all headers ExoPlayer needs ──────────────────────────────────
       const ct = upstream.headers['content-type'] || 'audio/flac';
       const cl = upstream.headers['content-length'];
+      const cr = upstream.headers['content-range'];   // "bytes X-Y/Z"
+      const ar = upstream.headers['accept-ranges'];   // "bytes"
+
       res.setHeader('Content-Type', ct);
       if (cl) res.setHeader('Content-Length', cl);
+      if (cr) res.setHeader('Content-Range', cr);
+      // Always advertise byte-range support so ExoPlayer knows it can seek
+      res.setHeader('Accept-Ranges', ar || 'bytes');
       res.setHeader('Cache-Control', 'no-store');
+
+      // CORS headers so ExoPlayer's OkHttp layer doesn't block the response
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type');
+
       upstream.pipe(res);
       req.on('close', () => upstream.destroy());
     }
   );
+
   proxyReq.on('error', (err) => {
     console.error('[tidal-download/stream] Request error:', err.message);
     if (!res.headersSent) res.status(502).json({ error: 'CDN connection failed', details: err.message });
   });
+
   proxyReq.end();
 });
 
