@@ -14,6 +14,18 @@ const PROD_ALLOWED = new Set([
   'audio4.tidal.com',
   'chorus.tidal.com',
   'cf-hls-media.tidal.com',
+  // V2 TIDAL proxy mirrors — used by frontend when requiresProxy: true
+  'triton.squid.wtf',
+  'hifi-one.spotisaver.net',
+  'hifi-two.spotisaver.net',
+  'tidal.kinoplus.online',
+  'hund.qqdl.site',
+  'katze.qqdl.site',
+  'maus.qqdl.site',
+  'vogel.qqdl.site',
+  'wolf.qqdl.site',
+  'arran.monochrome.tf',
+  'tidal.401658.xyz',
 ]);
 
 // In dev, also allow loopback for proxy self-test
