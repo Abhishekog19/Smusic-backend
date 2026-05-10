@@ -61,6 +61,8 @@ export function isOriginAllowed(origin) {
   if (!origin) return true;
   if (process.env.NODE_ENV !== 'production') return true;
   const allowed = getAllowedOrigins();
+  // If no origins configured, allow all (open API — operator must restrict if needed)
+  if (allowed.length === 0) return true;
   return allowed.some((a) => {
     if (a === '*' || a === origin) return true;
     if (a.startsWith('*.')) {
