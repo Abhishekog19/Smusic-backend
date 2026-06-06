@@ -25,12 +25,25 @@ Express.js API server that powers the Smusic and Groove apps.
 | `ALLOWED_ORIGINS` | No | Comma-separated allowed CORS origins |
 | `REDIS_URL` | No | Redis URL for caching (optional) |
 
-## Deploy on Railway
+## Deploy on Render
 
-1. Push this `server/` folder to a GitHub repo
-2. Create a new Railway project → Deploy from GitHub
-3. Railway auto-detects `package.json` and runs `npm start`
-4. Copy the generated URL and put it in Groove-app's `local.properties`
+1. Push the `Smusic-backend/` folder (repo root) to GitHub
+2. Go to [render.com](https://render.com) → **New** → **Blueprint**
+3. Connect your GitHub repo — Render will detect `render.yaml` automatically
+4. Click **Apply** — Render builds and deploys the service
+5. Copy the generated `https://<service>.onrender.com` URL and update it in Groove-app
+
+### Manual setup (without Blueprint)
+
+1. Go to **New** → **Web Service** → connect your repo
+2. Set **Root Directory** to `server`
+3. **Build Command**: `npm install`
+4. **Start Command**: `node index.js`
+5. Add env var: `NODE_ENV` = `production`
+6. **Health Check Path**: `/api/health`
+
+> **Note**: Render free tier spins down after 15 min of inactivity (cold start ~30s).
+> Upgrade to a paid plan or use [UptimeRobot](https://uptimerobot.com) to ping `/api/health` every 10 min to keep it warm.
 
 ## Local Development
 

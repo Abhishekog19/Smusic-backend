@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: smusic-backend
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      # Optional: Add REDIS_URL if you connect a Redis instance
+      # - key: REDIS_URL
+      #   fromService:
+      #     type: redis
+      #     name: smusic-redis
+      #     property: connectionString
