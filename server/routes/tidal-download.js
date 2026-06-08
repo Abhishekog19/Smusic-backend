@@ -309,7 +309,13 @@ router.get('/resolve', async (req, res) => {
     });
   } catch (err) {
     console.error('[tidal-download/resolve] Failed:', err.message);
-    return res.status(502).json({ error: 'Failed to resolve TIDAL stream', details: err.message });
+    // 403 from all mirrors = TIDAL has banned public mirror accounts (known issue per hifi-api README).
+    // Give a clear message instead of a cryptic proxy error.
+    const isMirrorBan = err.message?.includes('403') || err.message?.includes('Forbidden');
+    const userMessage = isMirrorBan
+      ? 'TIDAL streaming temporarily unavailable — provider accounts are being blocked. Try again later.'
+      : 'Failed to resolve TIDAL stream';
+    return res.status(502).json({ error: userMessage, details: err.message });
   }
 });
 
