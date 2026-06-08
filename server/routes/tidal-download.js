@@ -4,39 +4,18 @@ import https from 'https';
 import http from 'http';
 import { isOriginAllowed } from '../lib/proxyConfig.js';
 import { getSpotifyTrack } from '../lib/spotifySession.js';
+import { getLiveMirrors, FALLBACK_MIRRORS } from '../lib/mirrorDiscovery.js';
 
 const router = express.Router();
 
 // ─── V2 TIDAL Proxy Mirrors ──────────────────────────────────────────────────
-// These are the same proxy mirrors used by the web app (config.ts).
-// They handle TIDAL auth internally — no token needed from our side.
+// IMPORTANT: The static list below is kept ONLY as an emergency in-process fallback.
+// ALL previously hardcoded mirrors (squid.wtf, spotisaver.net, qqdl.site etc.)
+// are confirmed DEAD as of 2026-06-08 per Cloudflare Worker uptime checks.
+// fetchV2() now calls getLiveMirrors() to get fresh mirror URLs at runtime.
 const APP_VERSION = '1.0.0';
-
-const V2_TARGETS = [
-  { name: 'squid-api', baseUrl: 'https://triton.squid.wtf', weight: 15 },
-  { name: 'spotisaver-1', baseUrl: 'https://hifi-one.spotisaver.net', weight: 15 },
-  { name: 'spotisaver-2', baseUrl: 'https://hifi-two.spotisaver.net', weight: 15 },
-  { name: 'kinoplus', baseUrl: 'https://tidal.kinoplus.online', weight: 15 },
-  { name: 'hund', baseUrl: 'https://hund.qqdl.site', weight: 15 },
-  { name: 'katze', baseUrl: 'https://katze.qqdl.site', weight: 15 },
-  { name: 'maus', baseUrl: 'https://maus.qqdl.site', weight: 15 },
-  { name: 'vogel', baseUrl: 'https://vogel.qqdl.site', weight: 15 },
-  { name: 'wolf', baseUrl: 'https://wolf.qqdl.site', weight: 15 },
-  { name: 'monochrome', baseUrl: 'https://arran.monochrome.tf', weight: 15 },
-];
-
-const FALLBACK_BASE = 'https://tidal.401658.xyz';
+const FALLBACK_BASE = 'https://eu-central.monochrome.tf'; // was tidal.401658.xyz (dead)
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-
-function selectTarget() {
-  const totalWeight = V2_TARGETS.reduce((sum, t) => sum + t.weight, 0);
-  let r = Math.random() * totalWeight;
-  for (const target of V2_TARGETS) {
-    r -= target.weight;
-    if (r <= 0) return target;
-  }
-  return V2_TARGETS[0];
-}
 
 function buildHeaders(target) {
   const headers = { 'Accept': 'application/json', 'User-Agent': BROWSER_UA };
@@ -47,35 +26,37 @@ function buildHeaders(target) {
 
 /**
  * Fetch from V2 proxy with automatic retry across multiple mirrors.
+ * Dynamically fetches the live mirror list from Cloudflare Workers (cached 15 min).
  * Tries up to `maxAttempts` different targets before giving up.
  */
 async function fetchV2(path, maxAttempts = 10) {
+  // Get live mirrors (cached for 15 min, auto-refreshed by mirrorDiscovery)
+  const liveMirrors = await getLiveMirrors().catch(() => FALLBACK_MIRRORS);
+  const targets = liveMirrors.length > 0 ? liveMirrors : FALLBACK_MIRRORS;
+
   const tried = new Set();
   let lastError = null;
 
-  for (let i = 0; i < maxAttempts; i++) {
-    const target = selectTarget();
-    if (tried.has(target.name) && i < V2_TARGETS.length) {
-      const fallback = V2_TARGETS.find(t => !tried.has(t.name));
-      if (fallback) {
-        tried.add(fallback.name);
-        const url = `${fallback.baseUrl.replace(/\/+$/, '')}${path}`;
-        try {
-          const r = await fetch(url, { headers: buildHeaders(fallback), signal: AbortSignal.timeout(12000) });
-          if (r.ok) return { response: r, target: fallback };
-          console.warn(`[tidal-v2] ${fallback.name} returned ${r.status} for ${path}`);
-        } catch (err) {
-          console.warn(`[tidal-v2] ${fallback.name} failed: ${err.message}`);
-          lastError = err;
-        }
-        continue;
-      }
+  for (let i = 0; i < Math.min(maxAttempts, targets.length * 2); i++) {
+    // Weighted random selection from live mirrors
+    const totalWeight = targets.reduce((sum, t) => sum + (t.weight || 15), 0);
+    let r = Math.random() * totalWeight;
+    let target = targets[0];
+    for (const t of targets) {
+      r -= (t.weight || 15);
+      if (r <= 0) { target = t; break; }
+    }
+
+    if (tried.has(target.name) && tried.size < targets.length) {
+      // Already tried this one, find an untried mirror
+      const fallback = targets.find(t => !tried.has(t.name));
+      if (fallback) target = fallback;
     }
 
     tried.add(target.name);
     const url = `${target.baseUrl.replace(/\/+$/, '')}${path}`;
     try {
-      const r = await fetch(url, { headers: buildHeaders(target), signal: AbortSignal.timeout(8000) });
+      const r = await fetch(url, { headers: buildHeaders(target), signal: AbortSignal.timeout(12000) });
       if (r.ok) return { response: r, target };
       console.warn(`[tidal-v2] ${target.name} returned ${r.status} for ${path}`);
       lastError = new Error(`${target.name}: HTTP ${r.status}`);
@@ -83,6 +64,9 @@ async function fetchV2(path, maxAttempts = 10) {
       console.warn(`[tidal-v2] ${target.name} failed: ${err.message}`);
       lastError = err;
     }
+
+    // All unique mirrors tried — stop early
+    if (tried.size >= targets.length) break;
   }
 
   // Last resort: try fallback base
@@ -149,6 +133,14 @@ function decodeManifest(manifest) {
 
 function extractFromManifest(manifest) {
   const decoded = decodeManifest(manifest);
+
+  // Guard: detect segmented DASH (SegmentTemplate) — cannot extract a single URL from these.
+  // Returning null signals the caller to skip this manifest format.
+  if (/<SegmentTemplate/i.test(decoded)) {
+    console.warn('[tidal-v2] Segmented DASH manifest detected — cannot extract single stream URL');
+    return null;
+  }
+
   try {
     const parsed = JSON.parse(decoded);
     if (Array.isArray(parsed.urls) && parsed.urls.length > 0) return parsed.urls[0];
@@ -189,7 +181,7 @@ function extractStreamUrl(data) {
 }
 
 async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
-  const qualityMap = { LOSSLESS: 'LOSSLESS', HI_RES: 'HI_RES_LOSSLESS', HIGH: 'HIGH', LOW: 'LOW' };
+  const qualityMap = { LOSSLESS: 'LOSSLESS', HI_RES: 'HI_RES_LOSSLESS', HI_RES_LOSSLESS: 'HI_RES_LOSSLESS', HIGH: 'HIGH', LOW: 'LOW' };
   const tidalQuality = qualityMap[quality] || 'LOSSLESS';
   const path = `/track/?id=${trackId}&quality=${tidalQuality}`;
   const { response, target } = await fetchV2(path);
@@ -199,6 +191,34 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
   const format = tidalQuality.includes('LOSSLESS') ? 'flac' : 'm4a';
   console.log(`[tidal-v2] Stream URL via ${target.name}: ${streamUrl.substring(0, 80)}...`);
   return { streamUrl, format, quality: tidalQuality };
+}
+
+/**
+ * Quality fallback chain: tries from the requested quality downward.
+ * HI_RES_LOSSLESS → LOSSLESS → HIGH → LOW
+ */
+async function getTidalStreamUrlWithFallback(trackId, preferredQuality = 'LOSSLESS') {
+  const allQualities = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
+  const startIndex = allQualities.indexOf(preferredQuality);
+  // Start from the requested quality (or LOSSLESS if not found)
+  const chain = allQualities.slice(startIndex >= 0 ? startIndex : 1);
+
+  let lastError;
+  for (const q of chain) {
+    try {
+      const result = await getTidalStreamUrl(trackId, q);
+      if (result.streamUrl) {
+        if (q !== preferredQuality) {
+          console.log(`[tidal-v2] Quality fallback: ${preferredQuality} → ${q} for track ${trackId}`);
+        }
+        return result;
+      }
+    } catch (err) {
+      console.warn(`[tidal-v2] Quality ${q} failed for track ${trackId}: ${err.message}`);
+      lastError = err;
+    }
+  }
+  throw lastError || new Error(`No playable quality available for track ${trackId}`);
 }
 
 // ─── GET /api/tidal-download/search ──────────────────────────────────────────
@@ -253,11 +273,12 @@ router.get('/resolve', async (req, res) => {
 
   try {
     const track = await searchTidal({ title, artist, isrc });
-    const { streamUrl, format, quality: resolvedQuality } = await getTidalStreamUrl(track.id, quality);
+    // Use quality fallback chain instead of hard-failing on a single quality
+    const { streamUrl, format, quality: resolvedQuality } = await getTidalStreamUrlWithFallback(track.id, quality);
     const artistName = track.artists?.map(a => a.name).join(', ') || artist;
     const albumTitle = track.album?.title || '';
     const durationMs = (track.duration || 0) * 1000;
-    console.log(`[tidal-download/resolve] ✓ "${track.title}" → ${streamUrl.substring(0, 80)}...`);
+    console.log(`[tidal-download/resolve] ✓ "${track.title}" (${resolvedQuality}) → ${streamUrl.substring(0, 80)}...`);
     return res.json({ streamUrl, tidalTrackId: track.id, title: track.title || title, artist: artistName, album: albumTitle, durationMs, format, quality: resolvedQuality });
   } catch (err) {
     console.error('[tidal-download/resolve] Failed:', err.message);
