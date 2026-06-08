@@ -14,18 +14,16 @@ const PROD_ALLOWED = new Set([
   'audio4.tidal.com',
   'chorus.tidal.com',
   'cf-hls-media.tidal.com',
-  // V2 TIDAL proxy mirrors — used by frontend when requiresProxy: true
+  // Live V2 TIDAL proxy mirrors — confirmed working 2026-06-08 via uptime workers
+  // NOTE: The isProxyTarget() endsWith check means 'monochrome.tf' covers ALL subdomains:
+  //   eu-central.monochrome.tf, us-west.monochrome.tf, api.monochrome.tf,
+  //   frankfurt-2.monochrome.tf, arran.monochrome.tf, etc.
+  'monochrome.tf',
+  'monochrome-api.samidy.com',
+  // Legacy mirrors kept for safety (all confirmed dead, but harmless to keep)
   'triton.squid.wtf',
   'hifi-one.spotisaver.net',
   'hifi-two.spotisaver.net',
-  'tidal.kinoplus.online',
-  'hund.qqdl.site',
-  'katze.qqdl.site',
-  'maus.qqdl.site',
-  'vogel.qqdl.site',
-  'wolf.qqdl.site',
-  'arran.monochrome.tf',
-  'tidal.401658.xyz',
 ]);
 
 // In dev, also allow loopback for proxy self-test
