@@ -268,18 +268,45 @@ router.get('/resolve', async (req, res) => {
   const origin = req.headers.origin || null;
   res.setHeader('Access-Control-Allow-Origin', isOriginAllowed(origin) ? (origin || '*') : '*');
 
-  const { title, artist, isrc, quality = 'LOSSLESS' } = req.query;
-  if (!title || !artist) return res.status(400).json({ error: 'Missing required params: title, artist' });
+  const { title, artist, isrc, quality = 'LOSSLESS', tidalId } = req.query;
+
+  // tidalId shortcut: when the frontend already knows the track ID from a prior search,
+  // skip searchTidal() entirely — saves ~2-3 seconds and one mirror round-trip.
+  const resolveId = tidalId ? String(tidalId).trim() : null;
+  if (!resolveId && (!title || !artist)) {
+    return res.status(400).json({ error: 'Missing required params: tidalId or (title + artist)' });
+  }
 
   try {
-    const track = await searchTidal({ title, artist, isrc });
-    // Use quality fallback chain instead of hard-failing on a single quality
-    const { streamUrl, format, quality: resolvedQuality } = await getTidalStreamUrlWithFallback(track.id, quality);
-    const artistName = track.artists?.map(a => a.name).join(', ') || artist;
-    const albumTitle = track.album?.title || '';
-    const durationMs = (track.duration || 0) * 1000;
-    console.log(`[tidal-download/resolve] ✓ "${track.title}" (${resolvedQuality}) → ${streamUrl.substring(0, 80)}...`);
-    return res.json({ streamUrl, tidalTrackId: track.id, title: track.title || title, artist: artistName, album: albumTitle, durationMs, format, quality: resolvedQuality });
+    let trackId = resolveId;
+    let trackMeta = { title, artist };
+
+    if (!trackId) {
+      // No ID provided — fall back to search
+      const track = await searchTidal({ title, artist, isrc });
+      trackId = track.id;
+      trackMeta = {
+        title: track.title || title,
+        artist: track.artists?.map(a => a.name).join(', ') || artist,
+        album: track.album?.title || '',
+        durationMs: (track.duration || 0) * 1000,
+      };
+    }
+
+    // Use quality fallback chain: HI_RES_LOSSLESS → LOSSLESS → HIGH → LOW
+    const { streamUrl, format, quality: resolvedQuality } = await getTidalStreamUrlWithFallback(trackId, quality);
+
+    console.log(`[tidal-download/resolve] ✓ ID:${trackId} (${resolvedQuality}) → ${streamUrl.substring(0, 80)}...`);
+    return res.json({
+      streamUrl,
+      tidalTrackId: trackId,
+      title: trackMeta.title || title || '',
+      artist: trackMeta.artist || artist || '',
+      album: trackMeta.album || '',
+      durationMs: trackMeta.durationMs || 0,
+      format,
+      quality: resolvedQuality,
+    });
   } catch (err) {
     console.error('[tidal-download/resolve] Failed:', err.message);
     return res.status(502).json({ error: 'Failed to resolve TIDAL stream', details: err.message });
