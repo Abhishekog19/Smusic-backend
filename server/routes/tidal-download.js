@@ -4,7 +4,7 @@ import https from 'https';
 import http from 'http';
 import { isOriginAllowed } from '../lib/proxyConfig.js';
 import { getSpotifyTrack } from '../lib/spotifySession.js';
-import { getLiveMirrors, FALLBACK_MIRRORS } from '../lib/mirrorDiscovery.js';
+import { getLiveMirrors, FALLBACK_MIRRORS, invalidateMirrorCache } from '../lib/mirrorDiscovery.js';
 
 const router = express.Router();
 
@@ -59,7 +59,12 @@ async function fetchV2(path, maxAttempts = 10) {
       const r = await fetch(url, { headers: buildHeaders(target), signal: AbortSignal.timeout(12000) });
       if (r.ok) return { response: r, target };
       console.warn(`[tidal-v2] ${target.name} returned ${r.status} for ${path}`);
-      lastError = new Error(`${target.name}: HTTP ${r.status}`);
+      // Tag 403s so callers can detect mirror account bans
+      const err403 = new Error(`${target.name}: HTTP ${r.status}`);
+      err403.status = r.status;
+      lastError = err403;
+      // Stop trying mirrors for 4xx that aren't 403 (e.g. 404 = track not found)
+      if (r.status !== 403 && r.status < 500) break;
     } catch (err) {
       console.warn(`[tidal-v2] ${target.name} failed: ${err.message}`);
       lastError = err;
@@ -74,6 +79,9 @@ async function fetchV2(path, maxAttempts = 10) {
     const url = `${FALLBACK_BASE}${path}`;
     const r = await fetch(url, { headers: { 'Accept': 'application/json', 'User-Agent': BROWSER_UA }, signal: AbortSignal.timeout(8000) });
     if (r.ok) return { response: r, target: { name: 'fallback', baseUrl: FALLBACK_BASE } };
+    const fbErr = new Error(`fallback: HTTP ${r.status}`);
+    fbErr.status = r.status;
+    if (!lastError) lastError = fbErr;
   } catch (err) {
     console.warn(`[tidal-v2] Fallback also failed: ${err.message}`);
   }
@@ -195,15 +203,22 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
 
 /**
  * Quality fallback chain: tries from the requested quality downward.
- * HI_RES_LOSSLESS → LOSSLESS → HIGH → LOW
+ * LOSSLESS → HIGH → LOW  (HI_RES is skipped by default; account bans invalidate mirror cache)
+ *
+ * When ALL mirrors return 403 (TIDAL account banned on every mirror), the mirror cache
+ * is invalidated so fresh mirrors are fetched on the next request.
  */
 async function getTidalStreamUrlWithFallback(trackId, preferredQuality = 'LOSSLESS') {
+  // Build chain starting from preferred quality
   const allQualities = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
-  const startIndex = allQualities.indexOf(preferredQuality);
-  // Start from the requested quality (or LOSSLESS if not found)
-  const chain = allQualities.slice(startIndex >= 0 ? startIndex : 1);
+  let startIndex = allQualities.indexOf(preferredQuality);
+  // Default start at LOSSLESS (index 1) so we don't waste time on HI_RES_LOSSLESS
+  if (startIndex < 0) startIndex = 1;
+  const chain = allQualities.slice(startIndex);
 
   let lastError;
+  let consecutiveBans = 0;
+
   for (const q of chain) {
     try {
       const result = await getTidalStreamUrl(trackId, q);
@@ -216,8 +231,20 @@ async function getTidalStreamUrlWithFallback(trackId, preferredQuality = 'LOSSLE
     } catch (err) {
       console.warn(`[tidal-v2] Quality ${q} failed for track ${trackId}: ${err.message}`);
       lastError = err;
+      // Count 403 bans across quality attempts
+      if (err.status === 403 || err.message?.includes('HTTP 403')) {
+        consecutiveBans++;
+      }
     }
   }
+
+  // If all qualities resulted in 403 bans, the mirror accounts are all banned.
+  // Invalidate the cache so fresh mirrors are fetched on next attempt.
+  if (consecutiveBans >= chain.length) {
+    console.warn(`[tidal-v2] All mirrors returned 403 for track ${trackId} — invalidating mirror cache for fresh discovery`);
+    invalidateMirrorCache();
+  }
+
   throw lastError || new Error(`No playable quality available for track ${trackId}`);
 }
 
@@ -309,13 +336,17 @@ router.get('/resolve', async (req, res) => {
     });
   } catch (err) {
     console.error('[tidal-download/resolve] Failed:', err.message);
-    // 403 from all mirrors = TIDAL has banned public mirror accounts (known issue per hifi-api README).
-    // Give a clear message instead of a cryptic proxy error.
-    const isMirrorBan = err.message?.includes('403') || err.message?.includes('Forbidden');
+    // 403 from all mirrors = TIDAL has banned the proxy mirror accounts.
+    // Return a distinct error code so the frontend can show a targeted message.
+    const isMirrorBan = err.status === 403 || err.message?.includes('HTTP 403') || err.message?.includes('Forbidden');
+    const isAllDown = err.message?.includes('All TIDAL proxy mirrors failed') || err.status === 503;
     const userMessage = isMirrorBan
-      ? 'TIDAL streaming temporarily unavailable — provider accounts are being blocked. Try again later.'
-      : 'Failed to resolve TIDAL stream';
-    return res.status(502).json({ error: userMessage, details: err.message });
+      ? 'TIDAL mirror accounts are currently blocked — stream quality temporarily unavailable. Try downloading at a lower quality.'
+      : isAllDown
+        ? 'All TIDAL proxy mirrors are currently unreachable. Please try again in a few minutes.'
+        : 'Failed to resolve TIDAL stream.';
+    const statusCode = isMirrorBan ? 403 : 502;
+    return res.status(statusCode).json({ error: userMessage, details: err.message, isMirrorBan, isAllDown });
   }
 });
 
