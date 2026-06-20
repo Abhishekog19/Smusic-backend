@@ -2,6 +2,10 @@ import express from 'express';
 import { createHash } from 'crypto';
 import { getRedisClient } from '../lib/redis.js';
 import { isProxyTarget, isOriginAllowed } from '../lib/proxyConfig.js';
+import dashParser from '../lib/dashParser.js';
+import { getTidalHeaders } from '../lib/proxyUtils.js';
+import { apiInstanceManager } from '../lib/apiInstances.js';
+import RetryManager from '../lib/retryManager.js';
 
 const router = express.Router();
 
@@ -159,4 +163,217 @@ router.options('/', (req, res) => {
   res.status(204).end();
 });
 
+// ─── TIDAL Typed Routes (Phase 1-3) ──────────────────────────────────────────
+// These named routes replace direct TIDAL API calls from the frontend.
+// They handle both DASH XML manifests and direct-URL manifests, with
+// automatic token injection and multi-instance retry/failover.
+
+// Lazily initialised — mirrors load on first request
+let _retryManager = null;
+async function getRetryManager() {
+  if (!_retryManager) {
+    const instances = await apiInstanceManager.getInstances('api');
+    _retryManager = new RetryManager(instances);
+    console.log(`[proxy] RetryManager initialised with ${instances.length} mirrors`);
+  }
+  return _retryManager;
+}
+
+/** Safely get a valid token from the token manager (optional — no crash if missing) */
+async function tryGetToken(req) {
+  try {
+    const tm = req.app.get('tokenManager');
+    if (tm) return await tm.getValidToken();
+  } catch (err) {
+    console.warn('[proxy] Token manager error:', err.message);
+  }
+  return null;
+}
+
+/**
+ * GET /api/proxy/track/:id
+ * Resolves a TIDAL track to a playable stream URL.
+ * Handles both direct-URL and DASH XML manifest formats.
+ */
+router.get('/track/:id', async (req, res) => {
+  const { id: trackId } = req.params;
+  const quality = req.query.quality || 'LOSSLESS';
+  const origin = req.headers.origin || null;
+  res.setHeader('Access-Control-Allow-Origin', isOriginAllowed(origin) ? (origin || '*') : '*');
+
+  if (!trackId) return res.status(400).json({ error: 'Track ID required' });
+
+  console.log(`\n[proxy/track] ID: ${trackId}, Quality: ${quality}`);
+
+  try {
+    const rm    = await getRetryManager();
+    const token = await tryGetToken(req);
+    const endpoint = `/v1/tracks/${trackId}/streamUrl?quality=${quality}`;
+
+    const response = await rm.executeWithRetry(endpoint, {
+      headers: getTidalHeaders({ ...(token ? { 'Authorization': `Bearer ${token}` } : {}) }),
+    });
+
+    const manifest = await response.json();
+
+    // Format A: Direct URL (simple, most common)
+    if (dashParser.isDirectUrlManifest(manifest)) {
+      console.log('[proxy/track] ✅ Direct URL format');
+      return res.json({
+        type:       'direct',
+        url:        manifest.urls[0],
+        bitDepth:   manifest.bitDepth   ?? null,
+        sampleRate: manifest.sampleRate ?? null,
+        quality,
+      });
+    }
+
+    // Format B: DASH XML manifest (base64-encoded)
+    if (dashParser.isDashManifest(manifest)) {
+      console.log('[proxy/track] ✅ DASH XML format — parsing...');
+      try {
+        const dashManifest  = await dashParser.parseManifest(manifest.manifest);
+        const segmentUrls   = dashParser.generateSegmentUrls(dashManifest);
+        console.log(`[proxy/track] Generated ${segmentUrls.length} segment URLs`);
+
+        return res.json({
+          type:         'dash',
+          baseUrl:      dashManifest.baseUrl,
+          initialization: dashManifest.initialization,
+          media:        dashManifest.media,
+          segmentUrls,
+          mimeType:     dashManifest.mimeType,
+          codecs:       dashManifest.codecs,
+          quality,
+        });
+      } catch (dashErr) {
+        console.error('[proxy/track] DASH parse failed:', dashErr.message);
+        return res.status(502).json({ error: 'DASH manifest parse failed', details: dashErr.message });
+      }
+    }
+
+    // Unknown format
+    console.warn('[proxy/track] Unknown manifest format, keys:', Object.keys(manifest));
+    return res.status(400).json({ error: 'Unknown manifest format', keys: Object.keys(manifest) });
+
+  } catch (err) {
+    console.error('[proxy/track] Error:', err.message);
+    if (err.status === 404) return res.status(404).json({ error: 'Track not found' });
+    if (err.status === 401) return res.status(401).json({ error: 'Authentication failed' });
+    return res.status(503).json({
+      error:   'Failed to resolve track from all TIDAL mirrors',
+      details: err.message,
+    });
+  }
+});
+
+/**
+ * GET /api/proxy/search?q=…&limit=20
+ * Search TIDAL via proxy mirrors.
+ */
+router.get('/search', async (req, res) => {
+  const query = req.query.q;
+  const limit = Math.min(parseInt(req.query.limit || '20', 10), 50);
+  const origin = req.headers.origin || null;
+  res.setHeader('Access-Control-Allow-Origin', isOriginAllowed(origin) ? (origin || '*') : '*');
+
+  if (!query?.trim()) return res.status(400).json({ error: 'Search query required (param: q)' });
+
+  console.log(`[proxy/search] Query: "${query}", Limit: ${limit}`);
+
+  try {
+    const rm    = await getRetryManager();
+    const token = await tryGetToken(req);
+    const endpoint = `/v1/search?query=${encodeURIComponent(query.trim())}&limit=${limit}&types=TRACKS`;
+
+    const response = await rm.executeWithRetry(endpoint, {
+      headers: getTidalHeaders({ ...(token ? { 'Authorization': `Bearer ${token}` } : {}) }),
+    });
+
+    const results = await response.json();
+    console.log(`[proxy/search] ✅ Results received`);
+    return res.json(results);
+
+  } catch (err) {
+    console.error('[proxy/search] Error:', err.message);
+    return res.status(503).json({ error: 'Search failed', details: err.message });
+  }
+});
+
+/**
+ * GET /api/proxy/album/:id
+ * Get album info from TIDAL.
+ */
+router.get('/album/:id', async (req, res) => {
+  const { id: albumId } = req.params;
+  const origin = req.headers.origin || null;
+  res.setHeader('Access-Control-Allow-Origin', isOriginAllowed(origin) ? (origin || '*') : '*');
+
+  console.log(`[proxy/album] ID: ${albumId}`);
+
+  try {
+    const rm    = await getRetryManager();
+    const token = await tryGetToken(req);
+
+    const response = await rm.executeWithRetry(`/v1/albums/${albumId}`, {
+      headers: getTidalHeaders({ ...(token ? { 'Authorization': `Bearer ${token}` } : {}) }),
+    });
+
+    const album = await response.json();
+    console.log(`[proxy/album] ✅ Loaded`);
+    return res.json(album);
+
+  } catch (err) {
+    console.error('[proxy/album] Error:', err.message);
+    if (err.status === 404) return res.status(404).json({ error: 'Album not found' });
+    return res.status(503).json({ error: 'Album fetch failed', details: err.message });
+  }
+});
+
+/**
+ * GET /api/proxy/artist/:id
+ * Get artist info from TIDAL.
+ */
+router.get('/artist/:id', async (req, res) => {
+  const { id: artistId } = req.params;
+  const origin = req.headers.origin || null;
+  res.setHeader('Access-Control-Allow-Origin', isOriginAllowed(origin) ? (origin || '*') : '*');
+
+  try {
+    const rm    = await getRetryManager();
+    const token = await tryGetToken(req);
+
+    const response = await rm.executeWithRetry(`/v1/artists/${artistId}`, {
+      headers: getTidalHeaders({ ...(token ? { 'Authorization': `Bearer ${token}` } : {}) }),
+    });
+
+    const artist = await response.json();
+    return res.json(artist);
+
+  } catch (err) {
+    console.error('[proxy/artist] Error:', err.message);
+    if (err.status === 404) return res.status(404).json({ error: 'Artist not found' });
+    return res.status(503).json({ error: 'Artist fetch failed', details: err.message });
+  }
+});
+
+/**
+ * GET /api/proxy/retry-status
+ * Monitoring endpoint — shows per-mirror failure tracking.
+ */
+router.get('/retry-status', async (req, res) => {
+  try {
+    const rm = await getRetryManager();
+    return res.json({
+      instances: rm.getStatus(),
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    return res.status(503).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 export default router;
+

@@ -5,6 +5,9 @@ require('dotenv').config();
 import express from 'express';
 import cors from 'cors';
 
+import { initializeTokenManager } from './lib/tokenManager.js';
+import { apiInstanceManager } from './lib/apiInstances.js';
+
 import proxyRoute from './routes/proxy.js';
 import audioProxyRoute from './routes/audio-proxy.js';
 import songlinkRoute from './routes/songlink.js';
@@ -17,6 +20,29 @@ import recommendationsRoute from './routes/recommendations.js';
 const app = express();
 const PORT = process.env.PORT || process.env.API_PORT || 3001;
 
+// ── Initialize token manager (graceful: server still starts without creds) ──
+if (process.env.TIDAL_CLIENT_ID && process.env.TIDAL_CLIENT_SECRET) {
+  try {
+    const tm = initializeTokenManager(
+      process.env.TIDAL_CLIENT_ID,
+      process.env.TIDAL_CLIENT_SECRET
+    );
+    app.set('tokenManager', tm);
+    console.log('✅ Token Manager initialized');
+  } catch (err) {
+    console.warn('⚠️  Token Manager init failed:', err.message);
+  }
+} else {
+  console.warn('⚠️  TIDAL_CLIENT_ID / TIDAL_CLIENT_SECRET not set — token refresh disabled');
+}
+
+// ── Pre-warm mirror discovery (async, non-blocking) ────────────────────────
+apiInstanceManager.loadInstances().then(mirrors => {
+  console.log(`✅ Mirror discovery: ${mirrors.length} live mirrors loaded`);
+}).catch(err => {
+  console.warn('⚠️  Mirror discovery failed (will use fallbacks):', err.message);
+});
+
 // Middleware
 app.use(express.json());
 app.use(cors({
@@ -26,7 +52,13 @@ app.use(cors({
 
 // Health check
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString(), port: PORT });
+  const tm = _req.app.get('tokenManager');
+  res.json({
+    status:    'ok',
+    timestamp: new Date().toISOString(),
+    port:      PORT,
+    token:     tm ? tm.getTokenInfo() : { status: 'not_configured' },
+  });
 });
 
 // API Routes
