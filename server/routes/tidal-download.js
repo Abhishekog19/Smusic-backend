@@ -5,6 +5,8 @@ import http from 'http';
 import { isOriginAllowed } from '../lib/proxyConfig.js';
 import { getSpotifyTrack } from '../lib/spotifySession.js';
 import { getLiveMirrors, FALLBACK_MIRRORS, invalidateMirrorCache } from '../lib/mirrorDiscovery.js';
+import dashParser from '../lib/dashParser.js';
+import { getTokenManager } from '../lib/tokenManager.js';
 
 const router = express.Router();
 
@@ -17,9 +19,197 @@ const APP_VERSION = '1.0.0';
 const FALLBACK_BASE = 'https://hifi.geeked.wtf'; // Top-priority mirror per Monochrome source
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-// Monochrome's reverse proxy to real TIDAL API — tried before community mirrors.
-// Returns 401 without a token (expected), but 200 with a valid Bearer token.
-// Path convention: /api/v1/... and /v1/... both work.
+// ─── TIDAL Direct Relay (Monochrome strategy) ────────────────────────────────
+// Multiple relay endpoints — tried in order until one succeeds.
+// td.if-it-runs-ship-it.lol mirrors api.tidal.com for TIDAL API calls.
+// tidal-proxy.monochrome.tf is Monochrome's own direct TIDAL proxy.
+const TIDAL_RELAY_URLS = [
+  'https://td.if-it-runs-ship-it.lol/api',       // Primary: runs-ship-it.lol relay
+  'https://tidal-proxy.monochrome.tf/api',        // Monochrome's own reverse proxy (wrapTidalUrl target)
+];
+const TIDAL_RELAY_BASE = TIDAL_RELAY_URLS[0]; // kept for backward compat
+const TIDAL_AUTH_URL   = 'https://auth.tidal.com/v1/oauth2/token';
+
+// Monochrome client creds (public, from functions/track/[id].js line 16-17)
+const FALLBACK_CLIENT_ID     = 'txNoH4kkV41MfH25';
+const FALLBACK_CLIENT_SECRET = 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=';
+
+// In-process token cache (relay always needs a fresh Bearer token)
+let _relayToken = null;
+let _relayTokenExpiry = 0;
+
+async function getRelayToken() {
+  if (_relayToken && Date.now() < _relayTokenExpiry - 60_000) return _relayToken;
+
+  // Try tokenManager singleton first (has the same creds anyway)
+  try {
+    const tm = getTokenManager();
+    _relayToken = await tm.getValidToken();
+    _relayTokenExpiry = tm.tokenExpiry || Date.now() + 3600_000;
+    console.log('[relay] ✅ Token from TokenManager singleton');
+    return _relayToken;
+  } catch (_) { /* not initialized — get fresh */ }
+
+  // Fallback: request directly with Monochrome's public creds
+  const clientId     = FALLBACK_CLIENT_ID;
+  const clientSecret = FALLBACK_CLIENT_SECRET;
+  const body = new URLSearchParams({
+    grant_type:    'client_credentials',
+    client_id:     clientId,
+    client_secret: clientSecret,
+  });
+  const res = await fetch(TIDAL_AUTH_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type':  'application/x-www-form-urlencoded',
+      'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
+    },
+    body: body.toString(),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`Relay token request failed: ${res.status}`);
+  const data = await res.json();
+  _relayToken = data.access_token;
+  _relayTokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+  console.log('[relay] ✅ Fresh token acquired via Monochrome creds');
+  return _relayToken;
+}
+
+/**
+ * Resolve a TIDAL track stream via the direct relay (td.if-it-runs-ship-it.lol).
+ * Mirrors exactly Monochrome's TidalAPI.fetchJson() + getStreamUrl() approach.
+ * Returns { streamUrl, format, segmentUrls, isDash } or throws.
+ *
+ * Tries multiple relay URLs in sequence — if one returns 403/401, tries the next.
+ */
+async function resolveViaRelay(trackId, quality = 'LOSSLESS') {
+  const qualityMap = { LOSSLESS: 'LOSSLESS', HIGH: 'HIGH', LOW: 'LOW', HI_RES_LOSSLESS: 'HI_RES_LOSSLESS' };
+  const tidalQuality = qualityMap[quality] || 'LOSSLESS';
+
+  let token = await getRelayToken();
+
+  // Build the standard TIDAL API path
+  const apiPath = `/v1/tracks/${trackId}/playbackinfopostpaywall`;
+  const apiParams = new URLSearchParams({
+    audioquality:       tidalQuality,
+    playbackmode:       'STREAM',
+    assetpresentation:  'FULL',
+    countryCode:        'US',
+    immersiveAudio:     'false',
+  });
+
+  let lastErr = null;
+
+  for (let attempt = 0; attempt < TIDAL_RELAY_URLS.length; attempt++) {
+    const relayBase = TIDAL_RELAY_URLS[attempt];
+    // Some relays need /api prefix, some don't
+    const relayUrl = `${relayBase}${apiPath}?${apiParams.toString()}`;
+    console.log(`[relay] Attempt ${attempt + 1}/${TIDAL_RELAY_URLS.length} GET ${relayUrl.substring(0, 100)}...`);
+
+    try {
+      const r = await fetch(relayUrl, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'User-Agent':    'okhttp/5.3.2',
+          'Accept':        'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        console.warn(`[relay] ${r.status} from ${relayBase} for track ${trackId} quality ${tidalQuality}: ${body.substring(0, 200)}`);
+
+        if (r.status === 401) {
+          // Token expired mid-session — force refresh and retry this relay
+          console.log('[relay] 401 received — refreshing token and retrying...');
+          _relayToken = null; _relayTokenExpiry = 0;
+          try {
+            token = await getRelayToken();
+            // Retry same relay with fresh token (don't advance attempt counter)
+            const r2 = await fetch(relayUrl, {
+              headers: { 'Authorization': `Bearer ${token}`, 'User-Agent': 'okhttp/5.3.2', 'Accept': 'application/json' },
+              signal: AbortSignal.timeout(15_000),
+            });
+            if (r2.ok) {
+              const data2 = await r2.json();
+              return await _parseRelayResponse(data2, trackId, tidalQuality);
+            }
+            console.warn(`[relay] Still ${r2.status} after token refresh on ${relayBase}`);
+          } catch (retryErr) {
+            console.warn(`[relay] Token refresh retry failed: ${retryErr.message}`);
+          }
+        }
+
+        const err = new Error(`Relay ${relayBase} returned HTTP ${r.status} for track ${trackId}`);
+        err.status = r.status;
+        lastErr = err;
+        // On 403, try next relay (different IP may not be blocked)
+        if (r.status === 403) continue;
+        // On other errors (401 after retry, 404, 429), stop relay attempts
+        break;
+      }
+
+      const data = await r.json();
+      console.log(`[relay] ✅ Response from ${relayBase} — manifestMimeType: ${data.manifestMimeType}, hasUrls: ${!!data.urls}`);
+      return await _parseRelayResponse(data, trackId, tidalQuality);
+
+    } catch (fetchErr) {
+      console.warn(`[relay] Network error on ${relayBase}: ${fetchErr.message}`);
+      lastErr = fetchErr;
+      // Try next relay on network failure
+      continue;
+    }
+  }
+
+  // All relay attempts exhausted
+  const finalErr = lastErr || new Error(`All relay endpoints failed for track ${trackId}`);
+  if (!finalErr.status) finalErr.status = 503;
+  throw finalErr;
+}
+
+/**
+ * Parse a TIDAL relay response into { streamUrl|segmentUrls, format, isDash }
+ */
+async function _parseRelayResponse(data, trackId, tidalQuality) {
+  // ── Case 1: Direct URL manifest ────────────────────────────────────
+  if (dashParser.isDirectUrlManifest(data)) {
+    const streamUrl = data.urls[0];
+    const fmt = tidalQuality.includes('LOSSLESS') ? 'flac' : 'm4a';
+    return { streamUrl, format: fmt, isDash: false };
+  }
+
+  // ── Case 2: DASH XML manifest ──────────────────────────────────────
+  if (dashParser.isDashManifest(data)) {
+    const manifest = await dashParser.parseManifest(data.manifest);
+    const segmentUrls = dashParser.generateSegmentUrls(manifest);
+    if (segmentUrls.length === 0) throw new Error('DASH manifest produced zero segment URLs');
+    console.log(`[relay] DASH → ${segmentUrls.length} segments, codec: ${manifest.codecs}`);
+    return {
+      segmentUrls,
+      format: 'dash',
+      mimeType: manifest.mimeType || 'audio/mp4',
+      isDash: true,
+    };
+  }
+
+  // ── Case 3: Try extracting URL from legacy manifest string ─────────────
+  if (data.manifest) {
+    const decoded = Buffer.from(data.manifest.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8');
+    const urlMatch = decoded.match(/https?:\/\/[\w\-.~:?#[\]@!$&'()*+,;=%/]+/g);
+    if (urlMatch) {
+      const streamUrl = urlMatch[0];
+      return { streamUrl, format: 'm4a', isDash: false };
+    }
+  }
+
+  // ── Case 4: legacy data.url or data.streamUrl ───────────────────────
+  const fallbackUrl = data.url || data.streamUrl;
+  if (fallbackUrl) return { streamUrl: fallbackUrl, format: 'm4a', isDash: false };
+
+  throw new Error(`Relay response has no extractable stream URL for track ${trackId}`);
+}
+
 const MONOCHROME_TIDAL_PROXY = 'https://tidal-proxy.monochrome.tf';
 
 function buildHeaders(target) {
@@ -227,6 +417,19 @@ function extractStreamUrl(data) {
 async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
   const qualityMap = { LOSSLESS: 'LOSSLESS', HI_RES: 'HI_RES_LOSSLESS', HI_RES_LOSSLESS: 'HI_RES_LOSSLESS', HIGH: 'HIGH', LOW: 'LOW' };
   const tidalQuality = qualityMap[quality] || 'LOSSLESS';
+
+  // ── Try the direct relay first (Monochrome strategy) ──────────────────────
+  try {
+    const result = await resolveViaRelay(trackId, tidalQuality);
+    console.log(`[tidal-v2] ✅ Stream via relay for track ${trackId} (${tidalQuality})`);
+    return { ...result, quality: tidalQuality };
+  } catch (relayErr) {
+    console.warn(`[tidal-v2] Relay failed (${relayErr.message}) — trying community mirrors`);
+    // Only propagate 403/auth errors immediately (no point trying mirrors)
+    if (relayErr.status === 401) throw relayErr;
+  }
+
+  // ── Fall back to community mirrors ────────────────────────────────────────
   const path = `/track/?id=${trackId}&quality=${tidalQuality}`;
   const { response, target } = await fetchV2(path);
   const data = await response.json();
@@ -357,7 +560,23 @@ router.get('/resolve', async (req, res) => {
     }
 
     // Use quality fallback chain: HI_RES_LOSSLESS → LOSSLESS → HIGH → LOW
-    const { streamUrl, format, quality: resolvedQuality } = await getTidalStreamUrlWithFallback(trackId, quality);
+    const result = await getTidalStreamUrlWithFallback(trackId, quality);
+    const { format, quality: resolvedQuality, isDash, streamUrl, segmentUrls, mimeType } = result;
+
+    if (isDash) {
+      console.log(`[tidal-download/resolve] ✓ ID:${trackId} (${resolvedQuality}) → DASH, ${segmentUrls.length} segments`);
+      return res.json({
+        tidalTrackId: trackId,
+        title: trackMeta.title || title || '',
+        artist: trackMeta.artist || artist || '',
+        album: trackMeta.album || '',
+        durationMs: trackMeta.durationMs || 0,
+        format: 'dash',
+        mimeType: mimeType || 'audio/mp4',
+        quality: resolvedQuality,
+        segmentUrls,
+      });
+    }
 
     console.log(`[tidal-download/resolve] ✓ ID:${trackId} (${resolvedQuality}) → ${streamUrl.substring(0, 80)}...`);
     return res.json({
