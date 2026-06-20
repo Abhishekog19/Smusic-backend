@@ -14,8 +14,13 @@ const router = express.Router();
 // are confirmed DEAD as of 2026-06-08 per Cloudflare Worker uptime checks.
 // fetchV2() now calls getLiveMirrors() to get fresh mirror URLs at runtime.
 const APP_VERSION = '1.0.0';
-const FALLBACK_BASE = 'https://eu-central.monochrome.tf'; // was tidal.401658.xyz (dead)
+const FALLBACK_BASE = 'https://hifi.geeked.wtf'; // Top-priority mirror per Monochrome source
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+// Monochrome's reverse proxy to real TIDAL API — tried before community mirrors.
+// Returns 401 without a token (expected), but 200 with a valid Bearer token.
+// Path convention: /api/v1/... and /v1/... both work.
+const MONOCHROME_TIDAL_PROXY = 'https://tidal-proxy.monochrome.tf';
 
 function buildHeaders(target) {
   const headers = { 'Accept': 'application/json', 'User-Agent': BROWSER_UA };
@@ -26,11 +31,45 @@ function buildHeaders(target) {
 
 /**
  * Fetch from V2 proxy with automatic retry across multiple mirrors.
- * Dynamically fetches the live mirror list from Cloudflare Workers (cached 15 min).
- * Tries up to `maxAttempts` different targets before giving up.
+ * 
+ * Attempt order (matches Monochrome's HiFiClient strategy):
+ *   Step 0 (optional): tidal-proxy.monochrome.tf  — direct TIDAL relay if token present
+ *   Step 1:            Live community mirrors (from uptime workers, priority-sorted)
+ *   Step 2:            FALLBACK_BASE (hifi.geeked.wtf)
  */
-async function fetchV2(path, maxAttempts = 10) {
-  // Get live mirrors (cached for 15 min, auto-refreshed by mirrorDiscovery)
+async function fetchV2(path, maxAttempts = 10, bearerToken = null) {
+  // ─── Step 0: Try Monochrome's direct TIDAL reverse proxy first ──────────────
+  // This bypasses all community mirrors and hits TIDAL directly via monochrome.tf.
+  // Requires a Bearer token — when available (token manager initialized), this is
+  // the most reliable path. Matches what Monochrome's HiFiClient.instance.query() does.
+  if (bearerToken) {
+    // Map community mirror paths (/track/?id=X) to standard TIDAL API paths (/v1/tracks/X)
+    const tidalPath = path
+      .replace(/^\/track\/\?id=(\d+)&quality=/, '/v1/tracks/$1/streamUrl?quality=')
+      .replace(/^\/search\/\?s=/, '/v1/search?query=')
+      .replace(/^\/search\/\?q=/, '/v1/search?query=');
+
+    const proxyUrl = `${MONOCHROME_TIDAL_PROXY}${tidalPath.startsWith('/') ? '' : '/'}${tidalPath}`;
+    try {
+      const r = await fetch(proxyUrl, {
+        headers: {
+          'Authorization': `Bearer ${bearerToken}`,
+          'User-Agent':    'okhttp/5.3.2',
+          'Accept':        'application/json',
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (r.ok) {
+        console.log(`[tidal-v2] ✅ Direct proxy hit: ${MONOCHROME_TIDAL_PROXY}`);
+        return { response: r, target: { name: 'monochrome-proxy', baseUrl: MONOCHROME_TIDAL_PROXY } };
+      }
+      console.log(`[tidal-v2] Direct proxy returned ${r.status} — falling through to mirrors`);
+    } catch (proxyErr) {
+      console.log(`[tidal-v2] Direct proxy unreachable: ${proxyErr.message} — falling through`);
+    }
+  }
+
+  // ─── Step 1: Community mirrors (live list from uptime workers) ──────────────
   const liveMirrors = await getLiveMirrors().catch(() => FALLBACK_MIRRORS);
   const targets = liveMirrors.length > 0 ? liveMirrors : FALLBACK_MIRRORS;
 
@@ -38,17 +77,17 @@ async function fetchV2(path, maxAttempts = 10) {
   let lastError = null;
 
   for (let i = 0; i < Math.min(maxAttempts, targets.length * 2); i++) {
-    // Weighted random selection from live mirrors
-    const totalWeight = targets.reduce((sum, t) => sum + (t.weight || 15), 0);
+    // Weighted random selection — prioritySort already put hifi.geeked.wtf first,
+    // but weighted random ensures load spreads when that mirror is down.
+    const totalWeight = targets.reduce((sum, t) => sum + (t.weight || 10), 0);
     let r = Math.random() * totalWeight;
     let target = targets[0];
     for (const t of targets) {
-      r -= (t.weight || 15);
+      r -= (t.weight || 10);
       if (r <= 0) { target = t; break; }
     }
 
     if (tried.has(target.name) && tried.size < targets.length) {
-      // Already tried this one, find an untried mirror
       const fallback = targets.find(t => !tried.has(t.name));
       if (fallback) target = fallback;
     }
@@ -59,22 +98,19 @@ async function fetchV2(path, maxAttempts = 10) {
       const r = await fetch(url, { headers: buildHeaders(target), signal: AbortSignal.timeout(12000) });
       if (r.ok) return { response: r, target };
       console.warn(`[tidal-v2] ${target.name} returned ${r.status} for ${path}`);
-      // Tag 403s so callers can detect mirror account bans
       const err403 = new Error(`${target.name}: HTTP ${r.status}`);
       err403.status = r.status;
       lastError = err403;
-      // Stop trying mirrors for 4xx that aren't 403 (e.g. 404 = track not found)
       if (r.status !== 403 && r.status < 500) break;
     } catch (err) {
       console.warn(`[tidal-v2] ${target.name} failed: ${err.message}`);
       lastError = err;
     }
 
-    // All unique mirrors tried — stop early
     if (tried.size >= targets.length) break;
   }
 
-  // Last resort: try fallback base
+  // ─── Step 2: Hard fallback (top-priority mirror, direct) ───────────────────
   try {
     const url = `${FALLBACK_BASE}${path}`;
     const r = await fetch(url, { headers: { 'Accept': 'application/json', 'User-Agent': BROWSER_UA }, signal: AbortSignal.timeout(8000) });

@@ -1,26 +1,37 @@
 /**
  * mirrorDiscovery.js — Dynamic TIDAL API Mirror Discovery (Backend/Node.js)
  *
- * Server-side equivalent of the frontend mirrorDiscovery.js.
- * Uses native fetch (requires Node 18+ — confirmed via package.json engines field).
- * ESM module — use import/export syntax.
- *
- * Fetches live mirrors from Cloudflare Worker uptime endpoints every 15 minutes.
- * The workers return { api: [...], streaming: [], down: [...] } — we use `api`
- * since `streaming` is currently empty.
+ * Fetches live mirrors from the same uptime endpoint Monochrome uses.
+ * Priority order (matches Monochrome storage.js):
+ *   1. hifi.geeked.wtf (highest reliability per Monochrome source)
+ *   2. Official Monochrome CDN (eu-central, us-west, api.monochrome.tf, samidy)
+ *   3. qqdl.site community instances (shuffled)
  */
 
 const UPTIME_WORKERS = [
+  // Monochrome's own uptime tracker (primary source — same one Monochrome uses)
+  'https://tidal-uptime.geeked.wtf',
+  // Smusic Cloudflare worker mirrors as backup
   'https://tidal-uptime.jiffy-puffs-1j.workers.dev/',
   'https://tidal-uptime.props-76styles.workers.dev/',
 ];
 
-// Hardcoded fallback — monochrome.tf endpoints confirmed working 2026-06-08
-const FALLBACK_MIRRORS = [
-  { name: 'monochrome-eu', baseUrl: 'https://eu-central.monochrome.tf', weight: 15 },
-  { name: 'monochrome-us', baseUrl: 'https://us-west.monochrome.tf', weight: 15 },
-  { name: 'monochrome-api', baseUrl: 'https://api.monochrome.tf', weight: 10 },
-  { name: 'samidy', baseUrl: 'https://monochrome-api.samidy.com', weight: 10 },
+// Full mirror list sourced from monochrome-main/js/storage.js (fallback when all uptime workers fail)
+export const FALLBACK_MIRRORS = [
+  // Priority 1: highest-reliability per Monochrome source code
+  { name: 'hifi-geeked',    baseUrl: 'https://hifi.geeked.wtf',             weight: 20 },
+  // Priority 2: Official Monochrome CDN nodes
+  { name: 'monochrome-eu',  baseUrl: 'https://eu-central.monochrome.tf',    weight: 15 },
+  { name: 'monochrome-us',  baseUrl: 'https://us-west.monochrome.tf',       weight: 15 },
+  { name: 'monochrome-api', baseUrl: 'https://api.monochrome.tf',           weight: 10 },
+  { name: 'samidy',         baseUrl: 'https://monochrome-api.samidy.com',   weight: 10 },
+  // Priority 3: qqdl.site community instances (lower priority)
+  { name: 'maus-qqdl',     baseUrl: 'https://maus.qqdl.site',              weight: 8  },
+  { name: 'vogel-qqdl',    baseUrl: 'https://vogel.qqdl.site',             weight: 8  },
+  { name: 'katze-qqdl',    baseUrl: 'https://katze.qqdl.site',             weight: 8  },
+  { name: 'hund-qqdl',     baseUrl: 'https://hund.qqdl.site',              weight: 8  },
+  { name: 'wolf-qqdl',     baseUrl: 'https://wolf.qqdl.site',              weight: 6  },
+  { name: 'kinoplus',      baseUrl: 'https://tidal.kinoplus.online',       weight: 4  },
 ];
 
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
@@ -30,6 +41,26 @@ let lastFetchTime = 0;
 let fetchInFlight = null;
 
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+/**
+ * Priority-sort mirrors exactly as Monochrome does:
+ * hifi.geeked.wtf → official monochrome.tf/samidy → qqdl.site (shuffled)
+ */
+function prioritySort(mirrors) {
+  const top    = [];  // hifi.geeked.wtf
+  const middle = [];  // official CDN nodes
+  const bottom = [];  // qqdl community
+
+  for (const m of mirrors) {
+    const url = m.baseUrl || m.url || '';
+    if (url.includes('hifi.geeked.wtf'))  top.push(m);
+    else if (url.includes('.qqdl.site'))  bottom.push({ ...m, weight: 6 });
+    else                                  middle.push(m);
+  }
+
+  const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
+  return [...top, ...shuffle(middle), ...shuffle(bottom)];
+}
 
 async function fetchFromWorker(workerUrl) {
   try {
@@ -41,18 +72,20 @@ async function fetchFromWorker(workerUrl) {
 
     const data = await res.json();
 
-    // Use `api` array (has 4 live mirrors). `streaming` is currently empty.
-    const apiList = Array.isArray(data?.api) ? data.api : [];
+    // Monochrome uptime workers return { api: [...], streaming: [...] }
+    const apiList       = Array.isArray(data?.api)       ? data.api       : [];
     const streamingList = Array.isArray(data?.streaming) ? data.streaming : [];
     const combined = [...apiList, ...streamingList];
 
     if (combined.length === 0) return null;
 
-    return combined.map((entry, i) => ({
-      name: `worker-mirror-${i}`,
-      baseUrl: entry.url.replace(/\/$/, ''),
-      weight: 15,
+    const mirrors = combined.map((entry, i) => ({
+      name:    entry.name || `worker-mirror-${i}`,
+      baseUrl: (entry.url || entry.baseUrl || '').replace(/\/$/, ''),
+      weight:  entry.weight || 10,
     }));
+
+    return prioritySort(mirrors);
   } catch (err) {
     console.warn(`[mirrorDiscovery] Worker ${workerUrl} failed: ${err.message}`);
     return null;
@@ -60,6 +93,7 @@ async function fetchFromWorker(workerUrl) {
 }
 
 async function _fetchLiveMirrors() {
+  // Shuffle workers to avoid always hammering the same one first
   const workers = [...UPTIME_WORKERS].sort(() => Math.random() - 0.5);
 
   for (const worker of workers) {
@@ -70,14 +104,12 @@ async function _fetchLiveMirrors() {
     }
   }
 
-  console.warn('[mirrorDiscovery] Both workers unreachable — using fallback mirrors');
-  return FALLBACK_MIRRORS;
+  console.warn('[mirrorDiscovery] All uptime workers unreachable — using full fallback list');
+  return prioritySort([...FALLBACK_MIRRORS]);
 }
 
 /**
- * Returns the current live mirror list for use in fetchV2().
- * Call this at the top of fetchV2() to replace the static V2_TARGETS array.
- *
+ * Returns the current live mirror list.
  * @returns {Promise<Array<{name: string, baseUrl: string, weight: number}>>}
  */
 export async function getLiveMirrors() {
@@ -99,19 +131,17 @@ export async function getLiveMirrors() {
   }).catch(err => {
     fetchInFlight = null;
     console.error('[mirrorDiscovery] Fetch error:', err.message);
-    return cachedMirrors || FALLBACK_MIRRORS;
+    return cachedMirrors || prioritySort([...FALLBACK_MIRRORS]);
   });
 
   return fetchInFlight;
 }
 
 /**
- * Force-invalidate cache (e.g. after repeated mirror failures).
+ * Force-invalidate the mirror cache (e.g. after repeated failures).
  */
 export function invalidateMirrorCache() {
   cachedMirrors = null;
   lastFetchTime = 0;
   fetchInFlight = null;
 }
-
-export { FALLBACK_MIRRORS };
