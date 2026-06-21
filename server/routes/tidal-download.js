@@ -26,6 +26,7 @@ const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const TIDAL_RELAY_URLS = [
   'https://td.if-it-runs-ship-it.lol/api',       // Primary: runs-ship-it.lol relay
   'https://tidal-proxy.monochrome.tf/api',        // Monochrome's own reverse proxy (wrapTidalUrl target)
+  'https://hifi.geeked.wtf',                      // Also try top mirror as relay (supports /v1/ paths)
 ];
 const TIDAL_RELAY_BASE = TIDAL_RELAY_URLS[0]; // kept for backward compat
 const TIDAL_AUTH_URL   = 'https://auth.tidal.com/v1/oauth2/token';
@@ -88,77 +89,91 @@ async function resolveViaRelay(trackId, quality = 'LOSSLESS') {
 
   let token = await getRelayToken();
 
-  // Build the standard TIDAL API path
-  const apiPath = `/v1/tracks/${trackId}/playbackinfopostpaywall`;
-  const apiParams = new URLSearchParams({
-    audioquality:       tidalQuality,
-    playbackmode:       'STREAM',
-    assetpresentation:  'FULL',
-    countryCode:        'US',
-    immersiveAudio:     'false',
-  });
+  // CRITICAL: Use /playbackinfo (not /playbackinfopostpaywall)
+  // /playbackinfopostpaywall requires a USER SESSION token (subStatus 6004 = no sessionId)
+  // /playbackinfo works with client_credentials tokens (what we have)
+  // Source: Monochrome functions/track/[id].js line 55
+  const API_PATHS = [
+    {
+      path:    `/v1/tracks/${trackId}/playbackinfo`,
+      params:  new URLSearchParams({ audioquality: tidalQuality, playbackmode: 'STREAM', assetpresentation: 'FULL', countryCode: 'US' }),
+      label:   'playbackinfo',
+    },
+    // Fallback: try the postpaywall endpoint in case credentials were upgraded
+    {
+      path:    `/v1/tracks/${trackId}/playbackinfopostpaywall`,
+      params:  new URLSearchParams({ audioquality: tidalQuality, playbackmode: 'STREAM', assetpresentation: 'FULL', countryCode: 'US', immersiveAudio: 'false' }),
+      label:   'playbackinfopostpaywall',
+    },
+  ];
 
   let lastErr = null;
 
-  for (let attempt = 0; attempt < TIDAL_RELAY_URLS.length; attempt++) {
-    const relayBase = TIDAL_RELAY_URLS[attempt];
-    // Some relays need /api prefix, some don't
-    const relayUrl = `${relayBase}${apiPath}?${apiParams.toString()}`;
-    console.log(`[relay] Attempt ${attempt + 1}/${TIDAL_RELAY_URLS.length} GET ${relayUrl.substring(0, 100)}...`);
+  // Try each (relay, apiPath) combination: playbackinfo first (works with client_credentials),
+  // then playbackinfopostpaywall (requires user session — might work on some relays).
+  for (const { path: apiPath, params: apiParams, label } of API_PATHS) {
+    for (let attempt = 0; attempt < TIDAL_RELAY_URLS.length; attempt++) {
+      const relayBase = TIDAL_RELAY_URLS[attempt];
+      const relayUrl = `${relayBase}${apiPath}?${apiParams.toString()}`;
+      console.log(`[relay] [${label}] Attempt ${attempt + 1}/${TIDAL_RELAY_URLS.length} GET ${relayUrl.substring(0, 100)}...`);
 
-    try {
-      const r = await fetch(relayUrl, {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'User-Agent':    'okhttp/5.3.2',
-          'Accept':        'application/json',
-        },
-        signal: AbortSignal.timeout(15_000),
-      });
+      try {
+        const r = await fetch(relayUrl, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'User-Agent':    'okhttp/5.3.2',
+            'Accept':        'application/json',
+          },
+          signal: AbortSignal.timeout(15_000),
+        });
 
-      if (!r.ok) {
-        const body = await r.text().catch(() => '');
-        console.warn(`[relay] ${r.status} from ${relayBase} for track ${trackId} quality ${tidalQuality}: ${body.substring(0, 200)}`);
+        if (!r.ok) {
+          const body = await r.text().catch(() => '');
+          console.warn(`[relay] [${label}] ${r.status} from ${relayBase} for track ${trackId} quality ${tidalQuality}: ${body.substring(0, 200)}`);
 
-        if (r.status === 401) {
-          // Token expired mid-session — force refresh and retry this relay
-          console.log('[relay] 401 received — refreshing token and retrying...');
-          _relayToken = null; _relayTokenExpiry = 0;
-          try {
-            token = await getRelayToken();
-            // Retry same relay with fresh token (don't advance attempt counter)
-            const r2 = await fetch(relayUrl, {
-              headers: { 'Authorization': `Bearer ${token}`, 'User-Agent': 'okhttp/5.3.2', 'Accept': 'application/json' },
-              signal: AbortSignal.timeout(15_000),
-            });
-            if (r2.ok) {
-              const data2 = await r2.json();
-              return await _parseRelayResponse(data2, trackId, tidalQuality);
+          if (r.status === 401) {
+            // Token expired mid-session — force refresh and retry this relay ONCE
+            console.log('[relay] 401 received — refreshing token and retrying...');
+            _relayToken = null; _relayTokenExpiry = 0;
+            try {
+              token = await getRelayToken();
+              // Retry same relay with fresh token (don't advance attempt counter)
+              const r2 = await fetch(relayUrl, {
+                headers: { 'Authorization': `Bearer ${token}`, 'User-Agent': 'okhttp/5.3.2', 'Accept': 'application/json' },
+                signal: AbortSignal.timeout(15_000),
+              });
+              if (r2.ok) {
+                const data2 = await r2.json();
+                return await _parseRelayResponse(data2, trackId, tidalQuality);
+              }
+              console.warn(`[relay] [${label}] Still ${r2.status} after token refresh on ${relayBase} — trying next`);
+            } catch (retryErr) {
+              console.warn(`[relay] Token refresh retry failed: ${retryErr.message}`);
             }
-            console.warn(`[relay] Still ${r2.status} after token refresh on ${relayBase}`);
-          } catch (retryErr) {
-            console.warn(`[relay] Token refresh retry failed: ${retryErr.message}`);
+            // Always continue to next relay on 401
+            const err401 = new Error(`Relay ${relayBase} [${label}] returned HTTP 401 for track ${trackId}`);
+            err401.status = 401;
+            lastErr = err401;
+            continue;
           }
+
+          const err = new Error(`Relay ${relayBase} [${label}] returned HTTP ${r.status} for track ${trackId}`);
+          err.status = r.status;
+          lastErr = err;
+          // On 4xx/5xx, always try next relay (don't break — exhausting all is better than giving up early)
+          continue;
         }
 
-        const err = new Error(`Relay ${relayBase} returned HTTP ${r.status} for track ${trackId}`);
-        err.status = r.status;
-        lastErr = err;
-        // On 403, try next relay (different IP may not be blocked)
-        if (r.status === 403) continue;
-        // On other errors (401 after retry, 404, 429), stop relay attempts
-        break;
+        const data = await r.json();
+        console.log(`[relay] ✅ [${label}] Response from ${relayBase} — manifestMimeType: ${data.manifestMimeType}, hasUrls: ${!!data.urls}`);
+        return await _parseRelayResponse(data, trackId, tidalQuality);
+
+      } catch (fetchErr) {
+        console.warn(`[relay] [${label}] Network error on ${relayBase}: ${fetchErr.message}`);
+        lastErr = fetchErr;
+        // Try next relay on network failure
+        continue;
       }
-
-      const data = await r.json();
-      console.log(`[relay] ✅ Response from ${relayBase} — manifestMimeType: ${data.manifestMimeType}, hasUrls: ${!!data.urls}`);
-      return await _parseRelayResponse(data, trackId, tidalQuality);
-
-    } catch (fetchErr) {
-      console.warn(`[relay] Network error on ${relayBase}: ${fetchErr.message}`);
-      lastErr = fetchErr;
-      // Try next relay on network failure
-      continue;
     }
   }
 
@@ -227,7 +242,8 @@ function buildHeaders(target) {
  *   Step 1:            Live community mirrors (from uptime workers, priority-sorted)
  *   Step 2:            FALLBACK_BASE (hifi.geeked.wtf)
  */
-async function fetchV2(path, maxAttempts = 10, bearerToken = null) {
+async function fetchV2(path, maxAttempts = 10, bearerToken = null, opts = {}) {
+  const { continueOn404 = false } = opts;
   // ─── Step 0: Try Monochrome's direct TIDAL reverse proxy first ──────────────
   // This bypasses all community mirrors and hits TIDAL directly via monochrome.tf.
   // Requires a Bearer token — when available (token manager initialized), this is
@@ -288,10 +304,14 @@ async function fetchV2(path, maxAttempts = 10, bearerToken = null) {
       const r = await fetch(url, { headers: buildHeaders(target), signal: AbortSignal.timeout(12000) });
       if (r.ok) return { response: r, target };
       console.warn(`[tidal-v2] ${target.name} returned ${r.status} for ${path}`);
-      const err403 = new Error(`${target.name}: HTTP ${r.status}`);
-      err403.status = r.status;
-      lastError = err403;
-      if (r.status !== 403 && r.status < 500) break;
+      const errN = new Error(`${target.name}: HTTP ${r.status}`);
+      errN.status = r.status;
+      lastError = errN;
+      // Continue to next mirror on:
+      //  - 403 (banned), 404 (path not supported on this mirror, if allowed), 5xx (server error)
+      // Stop on other 4xx that indicate a bad request (e.g. 400, 401, 429)
+      const shouldContinue = r.status === 403 || r.status >= 500 || (continueOn404 && r.status === 404);
+      if (!shouldContinue) break;
     } catch (err) {
       console.warn(`[tidal-v2] ${target.name} failed: ${err.message}`);
       lastError = err;
@@ -414,22 +434,93 @@ function extractStreamUrl(data) {
   return null;
 }
 
+/**
+ * Try community mirrors using the standard TIDAL v1 API path.
+ * Some mirrors (hifi.geeked.wtf, monochrome.tf) support /v1/tracks/{id}/playbackinfopostpaywall
+ * which returns DASH manifest directly, unlike the mirror-specific /track/?id= path.
+ */
+async function resolveViaMirrorsDirect(trackId, tidalQuality) {
+  // Paths to try on community mirrors, in preference order
+  const apiPaths = [
+    // Standard TIDAL API path with Bearer token (preferred — returns DASH manifest)
+    // Use /playbackinfo NOT /playbackinfopostpaywall (client_credentials tokens work with /playbackinfo)
+    {
+      path: `/v1/tracks/${trackId}/playbackinfo?audioquality=${tidalQuality}&playbackmode=STREAM&assetpresentation=FULL&countryCode=US`,
+      needsAuth: true,
+    },
+    // Legacy community mirror path (returns wrapped stream URL)
+    {
+      path: `/track/?id=${trackId}&quality=${tidalQuality}`,
+      needsAuth: false,
+    },
+  ];
+
+  let lastErr = null;
+  for (const { path, needsAuth } of apiPaths) {
+    try {
+      let bearerToken = null;
+      if (needsAuth) {
+        try { bearerToken = await getRelayToken(); } catch (_) { /* skip auth path if no token */ continue; }
+      }
+      const { response, target } = await fetchV2(path, 10, bearerToken, { continueOn404: needsAuth });
+      const data = await response.json();
+      console.log(`[tidal-v2] Mirror direct response from ${target.name} (path: ${path.substring(0, 60)})`);
+
+      // Try DASH manifest first
+      if (dashParser.isDashManifest(data)) {
+        const manifest = await dashParser.parseManifest(data.manifest);
+        const segmentUrls = dashParser.generateSegmentUrls(manifest);
+        if (segmentUrls.length > 0) {
+          console.log(`[tidal-v2] ✅ DASH from mirror direct: ${segmentUrls.length} segments`);
+          return { segmentUrls, format: 'dash', mimeType: manifest.mimeType || 'audio/mp4', isDash: true };
+        }
+      }
+
+      // Try direct URL
+      if (dashParser.isDirectUrlManifest(data)) {
+        const streamUrl = data.urls[0];
+        const fmt = tidalQuality.includes('LOSSLESS') ? 'flac' : 'm4a';
+        console.log(`[tidal-v2] ✅ Direct URL from mirror direct: ${streamUrl.substring(0, 60)}`);
+        return { streamUrl, format: fmt, isDash: false };
+      }
+
+      // Try legacy extractStreamUrl as last resort
+      const streamUrl = extractStreamUrl(data);
+      if (streamUrl) {
+        const fmt = tidalQuality.includes('LOSSLESS') ? 'flac' : 'm4a';
+        console.log(`[tidal-v2] ✅ Legacy extracted URL from mirror: ${streamUrl.substring(0, 60)}`);
+        return { streamUrl, format: fmt, isDash: false };
+      }
+    } catch (err) {
+      console.warn(`[tidal-v2] Mirror direct path failed (${path.substring(0, 60)}): ${err.message}`);
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error(`Mirror direct resolution failed for track ${trackId}`);
+}
+
 async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
   const qualityMap = { LOSSLESS: 'LOSSLESS', HI_RES: 'HI_RES_LOSSLESS', HI_RES_LOSSLESS: 'HI_RES_LOSSLESS', HIGH: 'HIGH', LOW: 'LOW' };
   const tidalQuality = qualityMap[quality] || 'LOSSLESS';
 
-  // ── Try the direct relay first (Monochrome strategy) ──────────────────────
+  // ── Step 1: Try the direct relay (Monochrome strategy) ────────────────────
   try {
     const result = await resolveViaRelay(trackId, tidalQuality);
     console.log(`[tidal-v2] ✅ Stream via relay for track ${trackId} (${tidalQuality})`);
     return { ...result, quality: tidalQuality };
   } catch (relayErr) {
-    console.warn(`[tidal-v2] Relay failed (${relayErr.message}) — trying community mirrors`);
-    // Only propagate 403/auth errors immediately (no point trying mirrors)
-    if (relayErr.status === 401) throw relayErr;
+    console.warn(`[tidal-v2] All relays failed (${relayErr.message}) — trying mirror direct paths`);
   }
 
-  // ── Fall back to community mirrors ────────────────────────────────────────
+  // ── Step 2: Try community mirrors with v1 API path + legacy path ─────────
+  try {
+    const result = await resolveViaMirrorsDirect(trackId, tidalQuality);
+    return { ...result, quality: tidalQuality };
+  } catch (mirrorDirectErr) {
+    console.warn(`[tidal-v2] Mirror direct failed (${mirrorDirectErr.message}) — trying legacy community path`);
+  }
+
+  // ── Step 3: Fall back to legacy community mirror path ────────────────────
   const path = `/track/?id=${trackId}&quality=${tidalQuality}`;
   const { response, target } = await fetchV2(path);
   const data = await response.json();
@@ -461,7 +552,8 @@ async function getTidalStreamUrlWithFallback(trackId, preferredQuality = 'LOSSLE
   for (const q of chain) {
     try {
       const result = await getTidalStreamUrl(trackId, q);
-      if (result.streamUrl) {
+      // Accept both direct URL results and DASH results
+      if (result.streamUrl || result.isDash) {
         if (q !== preferredQuality) {
           console.log(`[tidal-v2] Quality fallback: ${preferredQuality} → ${q} for track ${trackId}`);
         }
@@ -474,6 +566,7 @@ async function getTidalStreamUrlWithFallback(trackId, preferredQuality = 'LOSSLE
       if (err.status === 403 || err.message?.includes('HTTP 403')) {
         consecutiveBans++;
       }
+      // Always continue to next quality — don't give up early
     }
   }
 
