@@ -11,6 +11,8 @@ import { getTokenManager } from '../lib/tokenManager.js';
 import { resolveQobuzStream, checkQobuzHealth } from '../lib/qobuzProxy.js';
 import { resolveDeezerStream, checkDeezerHealth } from '../lib/deezerProxy.js';
 import { resolveTrackMetadata } from '../lib/isrcResolver.js';
+// ─── Phase 2: Amazon Music ──────────────────────────────────────────
+import { resolveAmazonStream, getAmazonStatus } from '../lib/amazonMusicProxy.js';
 
 const router = express.Router();
 
@@ -567,7 +569,30 @@ async function resolveViaExternalSources(trackId, quality = 'LOSSLESS') {
     return null;
   }
 
-  // Step 2: Try Qobuz (primary — supports lossless FLAC + hi-res)
+  // Step 2: Try Amazon Music (highest quality, lowest latency — PRIMARY source)
+  // Requires a valid Turnstile JWT cached server-side (obtained from frontend Turnstile widget).
+  const amazonStatus = getAmazonStatus();
+  if (amazonStatus.hasJwt && !amazonStatus.isRateLimited) {
+    try {
+      const amazon = await resolveAmazonStream(trackMeta, quality);
+      if (amazon?.url) {
+        console.log(`[external] ✅ Amazon Music stream for track ${trackId}`);
+        return {
+          streamUrl: amazon.url,
+          format:    amazon.format || 'mp4',
+          provider:  'amazon',
+          quality,
+          isDash:    false,
+        };
+      }
+    } catch (amzErr) {
+      console.warn(`[external] Amazon failed: ${amzErr.message}`);
+    }
+  } else {
+    console.log(`[external] Amazon skipped (hasJwt:${amazonStatus.hasJwt}, rateLimited:${amazonStatus.isRateLimited})`);
+  }
+
+  // Step 3: Try Qobuz (primary fallback — supports lossless FLAC + hi-res)
   // Pass title+artist from TIDAL metadata so Qobuz can search by text (more reliable than raw ISRC)
   const qobuzMeta = { title: trackMeta?.title || '', artist: trackMeta?.artist || '' };
   try {

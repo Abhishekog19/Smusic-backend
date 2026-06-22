@@ -16,6 +16,7 @@ import resolveUrlRoute from './routes/resolve-url.js';
 import tidalDownloadRoute from './routes/tidal-download.js';
 import lyricsRoute from './routes/lyrics.js';
 import recommendationsRoute from './routes/recommendations.js';
+import amazonRoute from './routes/amazon.js';
 
 const app = express();
 const PORT = process.env.PORT || process.env.API_PORT || 3001;
@@ -70,6 +71,7 @@ app.use('/api/resolve-url', resolveUrlRoute);
 app.use('/api/tidal-download', tidalDownloadRoute);
 app.use('/api/lyrics', lyricsRoute);
 app.use('/api/recommendations', recommendationsRoute);
+app.use('/api/amazon', amazonRoute);
 
 // 404 handler
 app.use('/api/{*path}', (_req, res) => {
@@ -84,6 +86,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   /api/spotify-playlist   → Playlist track extractor`);
   console.log(`   /api/resolve-url        → Shortened URL resolver (mobile)`);
   console.log(`   /api/tidal-download     → TIDAL stream resolve + ZIP download`);
+  console.log(`   /api/amazon             → Amazon Music Turnstile auth + status`);
   console.log(`   /api/lyrics             → Synced lyrics (lrclib → lyrics.ovh fallback)`);
   console.log(`   /api/recommendations    → Similar tracks (Last.fm → TIDAL resolve)`);
   console.log(`   /api/health             → Health check\n`);
