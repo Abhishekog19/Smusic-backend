@@ -7,6 +7,10 @@ import { getSpotifyTrack } from '../lib/spotifySession.js';
 import { getLiveMirrors, FALLBACK_MIRRORS, invalidateMirrorCache } from '../lib/mirrorDiscovery.js';
 import dashParser from '../lib/dashParser.js';
 import { getTokenManager } from '../lib/tokenManager.js';
+// ─── Phase 1: External Audio Sources (Qobuz + Deezer) ────────────────────────
+import { resolveQobuzStream, checkQobuzHealth } from '../lib/qobuzProxy.js';
+import { resolveDeezerStream, checkDeezerHealth } from '../lib/deezerProxy.js';
+import { resolveTrackMetadata } from '../lib/isrcResolver.js';
 
 const router = express.Router();
 
@@ -532,6 +536,80 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
 }
 
 /**
+ * resolveViaExternalSources — Phase 1 primary audio resolution
+ *
+ * Tries Qobuz → Deezer using the track's ISRC code.
+ * These sources return FULL songs (no 30-second preview limitation).
+ * ISRC is fetched from TIDAL community mirrors (metadata only — no auth needed).
+ *
+ * Returns null if both sources fail (caller then falls back to TIDAL relay).
+ *
+ * @param {string|number} trackId  - TIDAL track ID
+ * @param {string}        quality  - Quality tier
+ * @returns {Promise<{streamUrl, format, provider, quality, isDash: false}|null>}
+ */
+async function resolveViaExternalSources(trackId, quality = 'LOSSLESS') {
+  let isrc = null;
+  let trackMeta = null;
+
+  // Step 1: Get ISRC from TIDAL metadata (community mirrors — metadata only)
+  try {
+    trackMeta = await resolveTrackMetadata(trackId);
+    isrc = trackMeta.isrc;
+    console.log(`[external] Got ISRC for track ${trackId}: ${isrc} ("${trackMeta.title}")`);
+  } catch (metaErr) {
+    console.warn(`[external] Could not fetch ISRC for track ${trackId}: ${metaErr.message}`);
+    return null; // Cannot do ISRC-based matching without ISRC
+  }
+
+  if (!isrc) {
+    console.warn(`[external] Track ${trackId} has no ISRC — cannot use external sources`);
+    return null;
+  }
+
+  // Step 2: Try Qobuz (primary — supports lossless FLAC + hi-res)
+  // Pass title+artist from TIDAL metadata so Qobuz can search by text (more reliable than raw ISRC)
+  const qobuzMeta = { title: trackMeta?.title || '', artist: trackMeta?.artist || '' };
+  try {
+    const qobuz = await resolveQobuzStream(isrc, quality, qobuzMeta);
+    if (qobuz?.url) {
+      console.log(`[external] ✅ Qobuz stream for track ${trackId} (ISRC: ${isrc})`);
+      return {
+        streamUrl: qobuz.url,
+        format:    qobuz.format || 'flac',
+        provider:  'qobuz',
+        quality,
+        isDash:    false,
+        rgInfo:    qobuz.rgInfo,
+      };
+    }
+  } catch (qobuzErr) {
+    console.warn(`[external] Qobuz failed for ISRC ${isrc}: ${qobuzErr.message}`);
+  }
+
+  // Step 3: Try Deezer (fallback — also supports FLAC via ISRC)
+  try {
+    const deezer = await resolveDeezerStream(isrc, quality);
+    if (deezer?.url) {
+      console.log(`[external] ✅ Deezer stream for track ${trackId} (ISRC: ${isrc})`);
+      return {
+        streamUrl: deezer.url,
+        format:    deezer.format?.toLowerCase() || 'flac',
+        provider:  'deezer',
+        quality,
+        isDash:    false,
+        rgInfo:    null,
+      };
+    }
+  } catch (deezerErr) {
+    console.warn(`[external] Deezer failed for ISRC ${isrc}: ${deezerErr.message}`);
+  }
+
+  console.warn(`[external] Both Qobuz and Deezer failed for track ${trackId} (ISRC: ${isrc})`);
+  return null;
+}
+
+/**
  * Quality fallback chain: tries from the requested quality downward.
  * LOSSLESS → HIGH → LOW  (HI_RES is skipped by default; account bans invalidate mirror cache)
  *
@@ -539,6 +617,23 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
  * is invalidated so fresh mirrors are fetched on the next request.
  */
 async function getTidalStreamUrlWithFallback(trackId, preferredQuality = 'LOSSLESS') {
+  // ════════════════════════════════════════════════════════════════
+  // PHASE 1 ADDITION: Try external sources FIRST (Qobuz → Deezer)
+  // These return full songs — no 30-second preview limitation.
+  // Only falls through to TIDAL mirrors if both external sources fail.
+  // ════════════════════════════════════════════════════════════════
+  try {
+    const external = await resolveViaExternalSources(trackId, preferredQuality);
+    if (external?.streamUrl) {
+      console.log(`[tidal-v2] ✅ Full song via ${external.provider} (track ${trackId})`);
+      return external;
+    }
+  } catch (extErr) {
+    console.warn(`[tidal-v2] External source resolution failed: ${extErr.message}`);
+  }
+
+  console.log(`[tidal-v2] External sources unavailable — falling back to TIDAL relays (30s preview risk)`);
+
   // Build chain starting from preferred quality
   const allQualities = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
   let startIndex = allQualities.indexOf(preferredQuality);
@@ -557,7 +652,7 @@ async function getTidalStreamUrlWithFallback(trackId, preferredQuality = 'LOSSLE
         if (q !== preferredQuality) {
           console.log(`[tidal-v2] Quality fallback: ${preferredQuality} → ${q} for track ${trackId}`);
         }
-        return result;
+        return { ...result, provider: 'tidal' };
       }
     } catch (err) {
       console.warn(`[tidal-v2] Quality ${q} failed for track ${trackId}: ${err.message}`);
@@ -577,7 +672,7 @@ async function getTidalStreamUrlWithFallback(trackId, preferredQuality = 'LOSSLE
     invalidateMirrorCache();
   }
 
-  throw lastError || new Error(`No playable quality available for track ${trackId}`);
+  throw lastError || new Error(`No playable quality available for track ${trackId} — all sources exhausted`);
 }
 
 // ─── GET /api/tidal-download/search ──────────────────────────────────────────
@@ -657,7 +752,7 @@ router.get('/resolve', async (req, res) => {
     const { format, quality: resolvedQuality, isDash, streamUrl, segmentUrls, mimeType } = result;
 
     if (isDash) {
-      console.log(`[tidal-download/resolve] ✓ ID:${trackId} (${resolvedQuality}) → DASH, ${segmentUrls.length} segments`);
+      console.log(`[tidal-download/resolve] ✓ ID:${trackId} (${resolvedQuality}) via ${result.provider || 'tidal'} → DASH, ${segmentUrls.length} segments`);
       return res.json({
         tidalTrackId: trackId,
         title: trackMeta.title || title || '',
@@ -667,17 +762,19 @@ router.get('/resolve', async (req, res) => {
         format: 'dash',
         mimeType: mimeType || 'audio/mp4',
         quality: resolvedQuality,
+        provider: result.provider || 'tidal',
         segmentUrls,
       });
     }
 
-    console.log(`[tidal-download/resolve] ✓ ID:${trackId} (${resolvedQuality}) → ${streamUrl.substring(0, 80)}...`);
+    console.log(`[tidal-download/resolve] ✓ ID:${trackId} (${resolvedQuality}) via ${result.provider || 'tidal'} → ${streamUrl.substring(0, 80)}...`);
     return res.json({
       streamUrl,
       tidalTrackId: trackId,
       title: trackMeta.title || title || '',
       artist: trackMeta.artist || artist || '',
       album: trackMeta.album || '',
+      provider: result.provider || 'tidal',
       durationMs: trackMeta.durationMs || 0,
       format,
       quality: resolvedQuality,
@@ -695,6 +792,28 @@ router.get('/resolve', async (req, res) => {
         : 'Failed to resolve TIDAL stream.';
     const statusCode = isMirrorBan ? 403 : 502;
     return res.status(statusCode).json({ error: userMessage, details: err.message, isMirrorBan, isAllDown });
+  }
+});
+
+// ─── GET /api/tidal-download/proxy-health ───────────────────────────────────────────
+// Returns health status of Qobuz and Deezer community proxies.
+router.get('/proxy-health', async (req, res) => {
+  const origin = req.headers.origin || null;
+  res.setHeader('Access-Control-Allow-Origin', isOriginAllowed(origin) ? (origin || '*') : '*');
+  res.setHeader('Cache-Control', 'no-store');
+
+  try {
+    const [qobuz, deezer] = await Promise.allSettled([
+      checkQobuzHealth(),
+      checkDeezerHealth(),
+    ]);
+
+    return res.json({
+      qobuz:  qobuz.status === 'fulfilled'  ? qobuz.value  : { ok: false, error: qobuz.reason?.message },
+      deezer: deezer.status === 'fulfilled' ? deezer.value : { ok: false, error: deezer.reason?.message },
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
