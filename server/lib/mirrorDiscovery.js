@@ -16,22 +16,23 @@ const UPTIME_WORKERS = [
   'https://tidal-uptime.props-76styles.workers.dev/',
 ];
 
-// Full mirror list sourced from monochrome-main/js/storage.js (fallback when all uptime workers fail)
+// Full mirror list — updated 2026-06-23 based on live health check results:
+//   DEAD: hifi.geeked.wtf (DNS), eu-central.monochrome.tf (503), all qqdl.site (timeout), kinoplus (DNS)
+//   ALIVE: us-west.monochrome.tf, api.monochrome.tf, monochrome-api.samidy.com
 export const FALLBACK_MIRRORS = [
-  // Priority 1: highest-reliability per Monochrome source code
-  { name: 'hifi-geeked',    baseUrl: 'https://hifi.geeked.wtf',             weight: 20 },
-  // Priority 2: Official Monochrome CDN nodes
-  { name: 'monochrome-eu',  baseUrl: 'https://eu-central.monochrome.tf',    weight: 15 },
-  { name: 'monochrome-us',  baseUrl: 'https://us-west.monochrome.tf',       weight: 15 },
-  { name: 'monochrome-api', baseUrl: 'https://api.monochrome.tf',           weight: 10 },
-  { name: 'samidy',         baseUrl: 'https://monochrome-api.samidy.com',   weight: 10 },
-  // Priority 3: qqdl.site community instances (lower priority)
-  { name: 'maus-qqdl',     baseUrl: 'https://maus.qqdl.site',              weight: 8  },
-  { name: 'vogel-qqdl',    baseUrl: 'https://vogel.qqdl.site',             weight: 8  },
-  { name: 'katze-qqdl',    baseUrl: 'https://katze.qqdl.site',             weight: 8  },
-  { name: 'hund-qqdl',     baseUrl: 'https://hund.qqdl.site',              weight: 8  },
-  { name: 'wolf-qqdl',     baseUrl: 'https://wolf.qqdl.site',              weight: 6  },
-  { name: 'kinoplus',      baseUrl: 'https://tidal.kinoplus.online',       weight: 4  },
+  // Priority 1: Confirmed ALIVE as of 2026-06-23
+  { name: 'monochrome-us',  baseUrl: 'https://us-west.monochrome.tf',       weight: 20 },
+  { name: 'monochrome-api', baseUrl: 'https://api.monochrome.tf',           weight: 18 },
+  { name: 'samidy',         baseUrl: 'https://monochrome-api.samidy.com',   weight: 16 },
+  // Priority 2: May come back online — lower weight so alive mirrors are preferred
+  { name: 'monochrome-eu',  baseUrl: 'https://eu-central.monochrome.tf',    weight: 5  },
+  { name: 'hifi-geeked',    baseUrl: 'https://hifi.geeked.wtf',             weight: 3  },
+  // Priority 3: qqdl.site — all timed out 2026-06-23 but kept in case they recover
+  { name: 'maus-qqdl',     baseUrl: 'https://maus.qqdl.site',              weight: 2  },
+  { name: 'vogel-qqdl',    baseUrl: 'https://vogel.qqdl.site',             weight: 2  },
+  { name: 'katze-qqdl',    baseUrl: 'https://katze.qqdl.site',             weight: 2  },
+  { name: 'hund-qqdl',     baseUrl: 'https://hund.qqdl.site',              weight: 2  },
+  { name: 'wolf-qqdl',     baseUrl: 'https://wolf.qqdl.site',              weight: 2  },
 ];
 
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes

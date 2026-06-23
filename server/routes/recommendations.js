@@ -27,16 +27,19 @@ const LASTFM_API_KEY = 'b25b959554ed76058ac220b7b2e0a026';
 const LASTFM_BASE    = 'https://ws.audioscrobbler.com/2.0';
 const BROWSER_UA     = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
 
+// V2_MIRRORS updated 2026-06-23 — only confirmed ALIVE mirrors
+// Dead as of 2026-06-23: triton.squid.wtf, spotisaver.net, all qqdl.site, hifi.geeked.wtf, kinoplus
 const V2_MIRRORS = [
-  { name: 'squid',       url: 'https://triton.squid.wtf' },
-  { name: 'spotisaver1', url: 'https://hifi-one.spotisaver.net' },
-  { name: 'spotisaver2', url: 'https://hifi-two.spotisaver.net' },
-  { name: 'hund',        url: 'https://hund.qqdl.site' },
-  { name: 'katze',       url: 'https://katze.qqdl.site' },
-  { name: 'maus',        url: 'https://maus.qqdl.site' },
-  { name: 'vogel',       url: 'https://vogel.qqdl.site' },
-  { name: 'wolf',        url: 'https://wolf.qqdl.site' },
-  { name: 'monochrome',  url: 'https://arran.monochrome.tf' },
+  { name: 'monochrome-us',  url: 'https://us-west.monochrome.tf' },
+  { name: 'monochrome-api', url: 'https://api.monochrome.tf' },
+  { name: 'samidy',         url: 'https://monochrome-api.samidy.com' },
+  // Keep these in case they recover
+  { name: 'monochrome-eu',  url: 'https://eu-central.monochrome.tf' },
+  { name: 'hund',           url: 'https://hund.qqdl.site' },
+  { name: 'katze',          url: 'https://katze.qqdl.site' },
+  { name: 'maus',           url: 'https://maus.qqdl.site' },
+  { name: 'vogel',          url: 'https://vogel.qqdl.site' },
+  { name: 'wolf',           url: 'https://wolf.qqdl.site' },
   // kinoplus intentionally excluded — returns HTML 200 (auth wall)
 ];
 

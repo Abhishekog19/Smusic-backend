@@ -22,17 +22,23 @@ const router = express.Router();
 // are confirmed DEAD as of 2026-06-08 per Cloudflare Worker uptime checks.
 // fetchV2() now calls getLiveMirrors() to get fresh mirror URLs at runtime.
 const APP_VERSION = '1.0.0';
-const FALLBACK_BASE = 'https://hifi.geeked.wtf'; // Top-priority mirror per Monochrome source
+// FALLBACK_BASE updated 2026-06-23: hifi.geeked.wtf confirmed DNS-dead, us-west.monochrome.tf is alive
+const FALLBACK_BASE = 'https://us-west.monochrome.tf';
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 // ─── TIDAL Direct Relay (Monochrome strategy) ────────────────────────────────
-// Multiple relay endpoints — tried in order until one succeeds.
-// td.if-it-runs-ship-it.lol mirrors api.tidal.com for TIDAL API calls.
-// tidal-proxy.monochrome.tf is Monochrome's own direct TIDAL proxy.
+// Updated 2026-06-23: tested each relay —
+//   td.if-it-runs-ship-it.lol   → 403 (free-tier client_creds get 403 on /playbackinfo)
+//   tidal-proxy.monochrome.tf   → 404 (path not found with our creds)
+//   hifi.geeked.wtf             → DNS dead
+// Alive monochrome mirrors added at end as community-relay fallbacks:
+//   us-west.monochrome.tf, api.monochrome.tf, monochrome-api.samidy.com → 200 on search
 const TIDAL_RELAY_URLS = [
   'https://td.if-it-runs-ship-it.lol/api',       // Primary: runs-ship-it.lol relay
-  'https://tidal-proxy.monochrome.tf/api',        // Monochrome's own reverse proxy (wrapTidalUrl target)
-  'https://hifi.geeked.wtf',                      // Also try top mirror as relay (supports /v1/ paths)
+  'https://tidal-proxy.monochrome.tf/api',        // Monochrome's own reverse proxy
+  'https://us-west.monochrome.tf',               // ✅ ALIVE 2026-06-23 — community mirror
+  'https://api.monochrome.tf',                   // ✅ ALIVE 2026-06-23 — community mirror
+  'https://monochrome-api.samidy.com',           // ✅ ALIVE 2026-06-23 — community mirror
 ];
 const TIDAL_RELAY_BASE = TIDAL_RELAY_URLS[0]; // kept for backward compat
 const TIDAL_AUTH_URL   = 'https://auth.tidal.com/v1/oauth2/token';
@@ -518,7 +524,7 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
     console.warn(`[tidal-v2] All relays failed (${relayErr.message}) — trying mirror direct paths`);
   }
 
-  // ── Step 2: Try community mirrors with v1 API path + legacy path ─────────
+  // ── Step 2: Try community mirrors with v1 API path + legacy path ─────────────
   try {
     const result = await resolveViaMirrorsDirect(trackId, tidalQuality);
     return { ...result, quality: tidalQuality };
@@ -526,7 +532,7 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
     console.warn(`[tidal-v2] Mirror direct failed (${mirrorDirectErr.message}) — trying legacy community path`);
   }
 
-  // ── Step 3: Fall back to legacy community mirror path ────────────────────
+  // ── Step 3: Fall back to legacy community mirror path ───────────────────
   const path = `/track/?id=${trackId}&quality=${tidalQuality}`;
   const { response, target } = await fetchV2(path);
   const data = await response.json();
@@ -538,115 +544,227 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
 }
 
 /**
- * resolveViaExternalSources — Phase 1 primary audio resolution
+ * resolveViaExternalSources — Full-song audio resolution
  *
- * Tries Qobuz → Deezer using the track's ISRC code.
- * These sources return FULL songs (no 30-second preview limitation).
- * ISRC is fetched from TIDAL community mirrors (metadata only — no auth needed).
+ * Priority order (fastest first, no hardcoded dead-mirror assumptions):
+ *   1. Amazon Music  — instant if JWT cached, uses title+artist (NOT ISRC)
+ *   2. Qobuz + Deezer — fired IN PARALLEL, first success wins (need ISRC)
  *
- * Returns null if both sources fail (caller then falls back to TIDAL relay).
- *
- * @param {string|number} trackId  - TIDAL track ID
- * @param {string}        quality  - Quality tier
+ * @param {string|number} trackId
+ * @param {string}        quality
+ * @param {{ title?: string, artist?: string, album?: string, duration?: number }} [fallbackMeta]
+ *   Title+artist from the frontend query params. Used when TIDAL metadata lookup
+ *   fails so that Amazon is never skipped due to a missing TIDAL mirror response.
  * @returns {Promise<{streamUrl, format, provider, quality, isDash: false}|null>}
  */
-async function resolveViaExternalSources(trackId, quality = 'LOSSLESS') {
-  let isrc = null;
+async function resolveViaExternalSources(trackId, quality = 'LOSSLESS', fallbackMeta = null) {
+  // ── Step 1: Fetch ISRC metadata (needed by Qobuz + Deezer) ─────────────────
+  // We fetch this FIRST so it's ready when Qobuz+Deezer fire in parallel.
+  // If this fails, we still try Amazon using fallbackMeta (title+artist from frontend).
   let trackMeta = null;
-
-  // Step 1: Get ISRC from TIDAL metadata (community mirrors — metadata only)
+  let isrc      = null;
   try {
     trackMeta = await resolveTrackMetadata(trackId);
-    isrc = trackMeta.isrc;
-    console.log(`[external] Got ISRC for track ${trackId}: ${isrc} ("${trackMeta.title}")`);
+    isrc      = trackMeta.isrc;
+    console.log(`[external] ISRC for track ${trackId}: ${isrc} ("${trackMeta.title}")`);
   } catch (metaErr) {
-    console.warn(`[external] Could not fetch ISRC for track ${trackId}: ${metaErr.message}`);
-    return null; // Cannot do ISRC-based matching without ISRC
+    console.warn(`[external] ISRC lookup failed for track ${trackId}: ${metaErr.message}`);
+    // No ISRC — Qobuz/Deezer will be skipped. Amazon can still work with fallbackMeta.
+    trackMeta = fallbackMeta || null;
   }
 
-  if (!isrc) {
-    console.warn(`[external] Track ${trackId} has no ISRC — cannot use external sources`);
-    return null;
-  }
-
-  // Step 2: Try Amazon Music (highest quality, lowest latency — PRIMARY source)
-  // Requires a valid Turnstile JWT cached server-side (obtained from frontend Turnstile widget).
+  // ── Step 2: Amazon Music — try first, uses title+artist (NOT ISRC) ───────────
+  // We always have title+artist from fallbackMeta (frontend query params),
+  // so Amazon is never skipped due to TIDAL metadata failures.
   const amazonStatus = getAmazonStatus();
-  if (amazonStatus.hasJwt && !amazonStatus.isRateLimited) {
+  const amazonMeta   = trackMeta; // full TIDAL meta OR { title, artist } fallback
+  if (amazonStatus.hasJwt && !amazonStatus.isRateLimited && amazonMeta?.title) {
+    console.log(`[external] Trying Amazon Music for "${amazonMeta.title}"...`);
     try {
-      const amazon = await resolveAmazonStream(trackMeta, quality);
+      const amazon = await resolveAmazonStream(amazonMeta, quality);
       if (amazon?.url) {
-        console.log(`[external] ✅ Amazon Music stream for track ${trackId}`);
+        console.log(`[external] ✅ Amazon Music — track ${trackId}`);
         return {
-          streamUrl: amazon.url,
-          format:    amazon.format || 'mp4',
-          provider:  'amazon',
+          streamUrl:     amazon.url,
+          format:        amazon.format || 'mp4',
+          provider:      'amazon',
           quality,
-          isDash:    false,
+          isDash:        false,
+          decryptionKey: amazon.decryptionKey || null,
+          asin:          amazon.asin || null,
+          replayGain:    amazon.replayGain || null,
         };
       }
     } catch (amzErr) {
       console.warn(`[external] Amazon failed: ${amzErr.message}`);
     }
   } else {
-    console.log(`[external] Amazon skipped (hasJwt:${amazonStatus.hasJwt}, rateLimited:${amazonStatus.isRateLimited})`);
+    console.log(`[external] Amazon skipped — hasJwt:${amazonStatus.hasJwt} rateLimited:${amazonStatus.isRateLimited} hasTitle:${!!amazonMeta?.title}`);
   }
 
-  // Step 3: Try Qobuz (primary fallback — supports lossless FLAC + hi-res)
-  // Pass title+artist from TIDAL metadata so Qobuz can search by text (more reliable than raw ISRC)
-  const qobuzMeta = { title: trackMeta?.title || '', artist: trackMeta?.artist || '' };
-  try {
-    const qobuz = await resolveQobuzStream(isrc, quality, qobuzMeta);
-    if (qobuz?.url) {
-      console.log(`[external] ✅ Qobuz stream for track ${trackId} (ISRC: ${isrc})`);
+  // ── Step 3: Qobuz + Deezer IN PARALLEL ─────────────────────────────────────
+  // Both use ISRC. Fire simultaneously — first success wins, the other is ignored.
+  // If Qobuz comes back from 502 this session, we catch it immediately.
+  // If Deezer recovers, we catch it immediately. No hardcoded "is down" flags.
+  if (isrc) {
+    const qobuzMeta = { title: trackMeta?.title || '', artist: trackMeta?.artist || '' };
+
+    const [qobuzResult, deezerResult] = await Promise.allSettled([
+      resolveQobuzStream(isrc, quality, qobuzMeta),
+      resolveDeezerStream(isrc, quality),
+    ]);
+
+    if (qobuzResult.status === 'fulfilled' && qobuzResult.value?.url) {
+      console.log(`[external] ✅ Qobuz — track ${trackId} (ISRC: ${isrc})`);
       return {
-        streamUrl: qobuz.url,
-        format:    qobuz.format || 'flac',
+        streamUrl: qobuzResult.value.url,
+        format:    qobuzResult.value.format || 'flac',
         provider:  'qobuz',
         quality,
         isDash:    false,
-        rgInfo:    qobuz.rgInfo,
+        rgInfo:    qobuzResult.value.rgInfo,
       };
     }
-  } catch (qobuzErr) {
-    console.warn(`[external] Qobuz failed for ISRC ${isrc}: ${qobuzErr.message}`);
-  }
-
-  // Step 3: Try Deezer (fallback — also supports FLAC via ISRC)
-  try {
-    const deezer = await resolveDeezerStream(isrc, quality);
-    if (deezer?.url) {
-      console.log(`[external] ✅ Deezer stream for track ${trackId} (ISRC: ${isrc})`);
+    if (deezerResult.status === 'fulfilled' && deezerResult.value?.url) {
+      console.log(`[external] ✅ Deezer — track ${trackId} (ISRC: ${isrc})`);
       return {
-        streamUrl: deezer.url,
-        format:    deezer.format?.toLowerCase() || 'flac',
+        streamUrl: deezerResult.value.url,
+        format:    (deezerResult.value.format || 'flac').toLowerCase(),
         provider:  'deezer',
         quality,
         isDash:    false,
-        rgInfo:    null,
       };
     }
-  } catch (deezerErr) {
-    console.warn(`[external] Deezer failed for ISRC ${isrc}: ${deezerErr.message}`);
+
+    console.warn(`[external] Qobuz+Deezer both failed for ISRC ${isrc}`);
+  } else {
+    console.warn(`[external] No ISRC — Qobuz+Deezer skipped`);
   }
 
-  console.warn(`[external] Both Qobuz and Deezer failed for track ${trackId} (ISRC: ${isrc})`);
-  return null;
+  return null; // All external sources failed — caller falls back to TIDAL
 }
 
 /**
- * Quality fallback chain: tries from the requested quality downward.
- * LOSSLESS → HIGH → LOW  (HI_RES is skipped by default; account bans invalidate mirror cache)
+ * raceTidalMirrors — Fire ALL live mirrors simultaneously, take first success.
  *
- * When ALL mirrors return 403 (TIDAL account banned on every mirror), the mirror cache
- * is invalidated so fresh mirrors are fetched on the next request.
+ * This replaces the sequential mirror loop. Instead of trying mirror-1, waiting,
+ * then mirror-2, etc., we launch ALL mirrors at once and take the first HTTP 200.
+ * Losers are aborted immediately. Typical latency = fastest mirror's response time.
+ *
+ * Paths tried per mirror:
+ *   1. /v1/tracks/{id}/playbackinfo  (TIDAL API path, needs Bearer token)
+ *   2. /track/?id={id}&quality={q}   (legacy community path, no auth)
+ *
+ * @param {string} trackId
+ * @param {string} tidalQuality  e.g. 'LOSSLESS', 'HIGH', 'LOW'
+ * @returns {Promise<{streamUrl?, segmentUrls?, format, isDash, mirror}>}
+ */
+async function raceTidalMirrors(trackId, tidalQuality) {
+  // Fetch live mirror list from uptime workers (cached 15 min — no extra latency)
+  const liveMirrors = await getLiveMirrors().catch(() => FALLBACK_MIRRORS);
+  if (liveMirrors.length === 0) throw new Error('No TIDAL mirrors available');
+
+  // Get bearer token for /playbackinfo path (reuses cached token — fast)
+  let bearerToken = null;
+  try { bearerToken = await getRelayToken(); } catch (_) { /* proceed without auth */ }
+
+  // Build all (mirror × path) combinations to race simultaneously
+  const controllers = new Map(); // mirrorName+path → AbortController
+  const racePromises = [];
+
+  // Cap at 10 mirrors to avoid flooding, sorted by weight (priority-sorted by mirrorDiscovery)
+  const mirrors = liveMirrors.slice(0, 10);
+
+  for (const mirror of mirrors) {
+    const baseUrl = mirror.baseUrl.replace(/\/+$/, '');
+    const mirrorKey = mirror.name;
+
+    // Path A: /playbackinfo with Bearer token (returns DASH or direct URL)
+    if (bearerToken) {
+      const acA = new AbortController();
+      controllers.set(`${mirrorKey}-playbackinfo`, acA);
+      const urlA = `${baseUrl}/v1/tracks/${trackId}/playbackinfo?audioquality=${tidalQuality}&playbackmode=STREAM&assetpresentation=FULL&countryCode=US`;
+
+      racePromises.push(
+        fetch(urlA, {
+          headers: { 'Authorization': `Bearer ${bearerToken}`, 'Accept': 'application/json', 'User-Agent': BROWSER_UA },
+          signal: acA.signal,
+        }).then(async r => {
+          if (!r.ok) throw Object.assign(new Error(`${mirror.name}/playbackinfo: HTTP ${r.status}`), { status: r.status });
+          const data = await r.json();
+          return _parseRelayResponse(data, trackId, tidalQuality).then(result => ({ ...result, mirror: mirror.name }));
+        })
+      );
+    }
+
+    // Path B: /track/?id= (legacy community path, no auth needed)
+    const acB = new AbortController();
+    controllers.set(`${mirrorKey}-track`, acB);
+    const urlB = `${baseUrl}/track/?id=${trackId}&quality=${tidalQuality}`;
+
+    racePromises.push(
+      fetch(urlB, {
+        headers: { 'Accept': 'application/json', 'User-Agent': BROWSER_UA, 'X-Client': `BiniLossless/${APP_VERSION}` },
+        signal: acB.signal,
+      }).then(async r => {
+        if (!r.ok) throw Object.assign(new Error(`${mirror.name}/track: HTTP ${r.status}`), { status: r.status });
+        const data = await r.json();
+        // Parse legacy response
+        if (dashParser.isDashManifest(data)) {
+          const manifest = await dashParser.parseManifest(data.manifest);
+          const segmentUrls = dashParser.generateSegmentUrls(manifest);
+          if (segmentUrls.length > 0) return { segmentUrls, format: 'dash', mimeType: manifest.mimeType || 'audio/mp4', isDash: true, mirror: mirror.name };
+        }
+        if (dashParser.isDirectUrlManifest(data)) {
+          const streamUrl = data.urls[0];
+          const fmt = tidalQuality.includes('LOSSLESS') ? 'flac' : 'm4a';
+          return { streamUrl, format: fmt, isDash: false, mirror: mirror.name };
+        }
+        const streamUrl = extractStreamUrl(data);
+        if (streamUrl) {
+          const fmt = tidalQuality.includes('LOSSLESS') ? 'flac' : 'm4a';
+          return { streamUrl, format: fmt, isDash: false, mirror: mirror.name };
+        }
+        throw new Error(`${mirror.name}/track: response has no stream URL`);
+      })
+    );
+  }
+
+  // Race all attempts — first success wins, all others are aborted immediately
+  let winner;
+  try {
+    winner = await Promise.any(racePromises);
+  } catch {
+    throw new Error(`All ${mirrors.length} TIDAL mirrors failed for track ${trackId} quality ${tidalQuality}`);
+  } finally {
+    // Abort all losing requests to free connections
+    for (const [, ac] of controllers) {
+      try { ac.abort(); } catch { /* ignore */ }
+    }
+  }
+
+  console.log(`[mirror-race] ✅ ${winner.mirror} won for track ${trackId} (${tidalQuality})`);
+  return winner;
+}
+
+/**
+ * getTidalStreamUrlWithFallback — Master resolution chain
+ *
+ * Fully parallel, dynamic — never hardcodes which sources are "currently down".
+ * Every request tries the full chain with short timeouts; dead sources fail fast.
+ *
+ * Resolution order:
+ *   1. Amazon Music      — instant if JWT ready, full song
+ *   2. Qobuz + Deezer    — parallel, first wins, full song
+ *   3. TIDAL mirror race — ALL live mirrors simultaneously, quality LOSSLESS→HIGH→LOW
+ *   4. TIDAL direct relay— last resort, may return 30-second preview
+ *
+ * @param {string} trackId
+ * @param {string} preferredQuality
  */
 async function getTidalStreamUrlWithFallback(trackId, preferredQuality = 'LOSSLESS') {
-  // ════════════════════════════════════════════════════════════════
-  // PHASE 1 ADDITION: Try external sources FIRST (Qobuz → Deezer)
-  // These return full songs — no 30-second preview limitation.
-  // Only falls through to TIDAL mirrors if both external sources fail.
-  // ════════════════════════════════════════════════════════════════
+
+  // ── Stage 1: External sources (Amazon → Qobuz+Deezer parallel) ─────────────
   try {
     const external = await resolveViaExternalSources(trackId, preferredQuality);
     if (external?.streamUrl) {
@@ -654,50 +772,54 @@ async function getTidalStreamUrlWithFallback(trackId, preferredQuality = 'LOSSLE
       return external;
     }
   } catch (extErr) {
-    console.warn(`[tidal-v2] External source resolution failed: ${extErr.message}`);
+    console.warn(`[tidal-v2] External sources error: ${extErr.message}`);
   }
 
-  console.log(`[tidal-v2] External sources unavailable — falling back to TIDAL relays (30s preview risk)`);
+  console.log(`[tidal-v2] External sources unavailable — trying TIDAL mirror race`);
 
-  // Build chain starting from preferred quality
-  const allQualities = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
-  let startIndex = allQualities.indexOf(preferredQuality);
-  // Default start at LOSSLESS (index 1) so we don't waste time on HI_RES_LOSSLESS
-  if (startIndex < 0) startIndex = 1;
-  const chain = allQualities.slice(startIndex);
-
-  let lastError;
+  // ── Stage 2: TIDAL mirror race — ALL mirrors fired simultaneously ───────────
+  // Quality chain: LOSSLESS → HIGH → LOW
+  // For each quality, race ALL live mirrors at once. If one mirror happens to
+  // have a working account for LOSSLESS, we get it instantly. If all 403, move to HIGH.
+  const qualityChain = ['LOSSLESS', 'HIGH', 'LOW'];
+  const startIdx = Math.max(0, qualityChain.indexOf(preferredQuality));
   let consecutiveBans = 0;
 
-  for (const q of chain) {
+  for (const q of qualityChain.slice(startIdx)) {
     try {
-      const result = await getTidalStreamUrl(trackId, q);
-      // Accept both direct URL results and DASH results
-      if (result.streamUrl || result.isDash) {
+      const result = await raceTidalMirrors(trackId, q);
+      if (result?.streamUrl || result?.isDash) {
         if (q !== preferredQuality) {
-          console.log(`[tidal-v2] Quality fallback: ${preferredQuality} → ${q} for track ${trackId}`);
+          console.log(`[tidal-v2] Quality degraded: ${preferredQuality} → ${q} (track ${trackId})`);
         }
-        return { ...result, provider: 'tidal' };
+        return { ...result, quality: q, provider: 'tidal' };
       }
-    } catch (err) {
-      console.warn(`[tidal-v2] Quality ${q} failed for track ${trackId}: ${err.message}`);
-      lastError = err;
-      // Count 403 bans across quality attempts
-      if (err.status === 403 || err.message?.includes('HTTP 403')) {
+    } catch (raceErr) {
+      console.warn(`[tidal-v2] Mirror race failed for ${q}: ${raceErr.message}`);
+      if (raceErr.message?.includes('403') || raceErr.message?.includes('HTTP 403')) {
         consecutiveBans++;
       }
-      // Always continue to next quality — don't give up early
     }
   }
 
-  // If all qualities resulted in 403 bans, the mirror accounts are all banned.
-  // Invalidate the cache so fresh mirrors are fetched on next attempt.
-  if (consecutiveBans >= chain.length) {
-    console.warn(`[tidal-v2] All mirrors returned 403 for track ${trackId} — invalidating mirror cache for fresh discovery`);
+  // If every quality got banned → mirrors accounts are all 403 → invalidate cache
+  // so next request gets fresh mirrors from the uptime worker
+  if (consecutiveBans >= qualityChain.length - startIdx) {
+    console.warn(`[tidal-v2] All qualities 403 for track ${trackId} — refreshing mirror list`);
     invalidateMirrorCache();
   }
 
-  throw lastError || new Error(`No playable quality available for track ${trackId} — all sources exhausted`);
+  // ── Stage 3: Direct relay (30-second preview last resort) ──────────────────
+  // td.if-it-runs-ship-it.lol and tidal-proxy.monochrome.tf are tried here.
+  // These return 30-second previews with client_credentials tokens.
+  // Better than nothing — at least the user hears something.
+  console.warn(`[tidal-v2] ⚠️ Falling back to relay — likely 30s preview (track ${trackId})`);
+  try {
+    const relayResult = await resolveViaRelay(trackId, preferredQuality);
+    return { ...relayResult, quality: preferredQuality, provider: 'tidal-preview' };
+  } catch (relayErr) {
+    throw new Error(`All sources exhausted for track ${trackId}: ${relayErr.message}`);
+  }
 }
 
 // ─── GET /api/tidal-download/search ──────────────────────────────────────────
@@ -772,8 +894,15 @@ router.get('/resolve', async (req, res) => {
       };
     }
 
-    // Use quality fallback chain: HI_RES_LOSSLESS → LOSSLESS → HIGH → LOW
-    const result = await getTidalStreamUrlWithFallback(trackId, quality);
+    // Pass title+artist from query params as fallbackMeta.
+    // resolveViaExternalSources uses these for Amazon when TIDAL metadata fails.
+    const fallbackMeta = {
+      title:  trackMeta.title  || title  || '',
+      artist: trackMeta.artist || artist || '',
+      album:  trackMeta.album  || '',
+      duration: trackMeta.durationMs ? Math.round(trackMeta.durationMs / 1000) : 0,
+    };
+    const result = await getTidalStreamUrlWithFallback(trackId, quality, fallbackMeta);
     const { format, quality: resolvedQuality, isDash, streamUrl, segmentUrls, mimeType } = result;
 
     if (isDash) {
@@ -803,6 +932,10 @@ router.get('/resolve', async (req, res) => {
       durationMs: trackMeta.durationMs || 0,
       format,
       quality: resolvedQuality,
+      // Amazon Music: CENC-encrypted stream needs this key to play.
+      // null for all other providers (TIDAL, Qobuz, Deezer are unencrypted).
+      decryptionKey: result.decryptionKey || null,
+      asin: result.asin || null,
     });
   } catch (err) {
     console.error('[tidal-download/resolve] Failed:', err.message);
