@@ -9,11 +9,10 @@
  */
 
 const UPTIME_WORKERS = [
-  // Monochrome's own uptime tracker (primary source — same one Monochrome uses)
-  'https://tidal-uptime.geeked.wtf',
-  // Smusic Cloudflare worker mirrors as backup
+  // Smusic Cloudflare worker mirrors (working as of 2026-06-23)
   'https://tidal-uptime.jiffy-puffs-1j.workers.dev/',
   'https://tidal-uptime.props-76styles.workers.dev/',
+  // NOTE: tidal-uptime.geeked.wtf removed — DNS not resolving (causes 5s startup delay)
 ];
 
 // Full mirror list — updated 2026-06-23 based on live health check results:

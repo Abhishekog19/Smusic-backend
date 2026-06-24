@@ -60,7 +60,7 @@ export function clearCachedJwt() {
 }
 
 function isRateLimited() { return Date.now() < _amazonRateLimitedUntil; }
-function setRateLimited() {
+export function setRateLimited() {
   _amazonRateLimitedUntil = Date.now() + RATE_LIMIT_DURATION_MS;
   clearCachedJwt();
   console.warn('[amazon] Rate limited for 30 minutes — falling back to Qobuz/Deezer');
@@ -142,7 +142,7 @@ function durationScore(expectedSec, actualSec) {
 const _asinCache = new Map();
 const ASIN_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
-async function searchAmazonAsin(title, artist, album = '', durationSec = 0) {
+export async function searchAmazonAsin(title, artist, album = '', durationSec = 0) {
   const cacheKey = normalize(`${title} ${artist}`).substring(0, 80);
   const cached = _asinCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < ASIN_CACHE_TTL) {
